@@ -1,0 +1,150 @@
+{
+  "_comment": "Recovery state machine. O(1) lookup by failure_type. No LLM in recovery path.",
+  "version": "1.0.0",
+
+  "playbook": {
+    "groq_rate_limit": {
+      "description": "Groq API 429 / RPM exceeded",
+      "steps": [
+        {
+          "id": "wait_60s",
+          "action": "sleep",
+          "params": {"seconds": 60},
+          "description": "Wait for RPM window to reset"
+        },
+        {
+          "id": "switch_to_deterministic",
+          "action": "set_degraded_mode",
+          "params": {"mode": "NO_LLM"},
+          "description": "Use rule-based scoring only"
+        },
+        {
+          "id": "log_event",
+          "action": "emit_event",
+          "params": {"event": "RECOVERY_DEGRADED", "reason": "groq_rate_limit"},
+          "description": "Alert operators via webhook"
+        }
+      ],
+      "fallback_mode": "NO_LLM",
+      "max_retries": 3,
+      "retry_delay_s": 60
+    },
+
+    "groq_timeout": {
+      "description": "Groq API call timed out",
+      "steps": [
+        {
+          "id": "retry_once",
+          "action": "retry_llm",
+          "params": {"max_attempts": 1, "timeout_s": 12},
+          "description": "Retry with doubled timeout"
+        },
+        {
+          "id": "fallback_deterministic",
+          "action": "set_degraded_mode",
+          "params": {"mode": "NO_LLM"},
+          "description": "Fall back to deterministic scoring"
+        }
+      ],
+      "fallback_mode": "NO_LLM",
+      "max_retries": 1,
+      "retry_delay_s": 2
+    },
+
+    "alchemy_down": {
+      "description": "Alchemy WebSocket disconnected or HTTP unavailable",
+      "steps": [
+        {
+          "id": "switch_to_anvil",
+          "action": "switch_rpc",
+          "params": {"target": "anvil", "url": "http://127.0.0.1:8545"},
+          "description": "Fall back to local Anvil node"
+        },
+        {
+          "id": "set_no_chain",
+          "action": "set_degraded_mode",
+          "params": {"mode": "NO_CHAIN"},
+          "description": "Disable chain writes if Anvil also unreachable"
+        },
+        {
+          "id": "alert",
+          "action": "emit_event",
+          "params": {"event": "RECOVERY_DEGRADED", "reason": "alchemy_down"},
+          "description": "Alert operators"
+        }
+      ],
+      "fallback_mode": "NO_CHAIN",
+      "max_retries": 3,
+      "retry_delay_s": 5
+    },
+
+    "chroma_down": {
+      "description": "ChromaDB embedding service unavailable",
+      "steps": [
+        {
+          "id": "skip_drift",
+          "action": "disable_agent",
+          "params": {"agent": "drift_monitor"},
+          "description": "Disable drift monitoring (requires vectors)"
+        },
+        {
+          "id": "skip_halluc_vector",
+          "action": "disable_feature",
+          "params": {"feature": "hallucination_vector_check"},
+          "description": "Hallucination agent falls back to regex-only"
+        },
+        {
+          "id": "set_no_vectors",
+          "action": "set_degraded_mode",
+          "params": {"mode": "NO_VECTORS"},
+          "description": "Disable all vector-based checks"
+        }
+      ],
+      "fallback_mode": "NO_VECTORS",
+      "max_retries": 2,
+      "retry_delay_s": 10
+    },
+
+    "sqlite_error": {
+      "description": "SQLite write/read failure",
+      "steps": [
+        {
+          "id": "retry_write",
+          "action": "retry_db",
+          "params": {"max_attempts": 3, "delay_s": 0.5},
+          "description": "Retry with exponential backoff"
+        },
+        {
+          "id": "in_memory_mode",
+          "action": "switch_db",
+          "params": {"mode": "memory", "target": ":memory:"},
+          "description": "Switch to in-memory SQLite if disk fails"
+        }
+      ],
+      "fallback_mode": "NORMAL",
+      "max_retries": 3,
+      "retry_delay_s": 0.5
+    },
+
+    "gas_oracle_down": {
+      "description": "Cannot fetch current gas price from chain",
+      "steps": [
+        {
+          "id": "use_cached_gas",
+          "action": "use_cache",
+          "params": {"cache_key": "gas_price_gwei_cached", "max_age_s": 300},
+          "description": "Use last known gas price (up to 5 min old)"
+        },
+        {
+          "id": "use_default_gas",
+          "action": "set_default",
+          "params": {"key": "gas_price_gwei", "value": 20},
+          "description": "Fall back to 20 gwei baseline"
+        }
+      ],
+      "fallback_mode": "NORMAL",
+      "max_retries": 2,
+      "retry_delay_s": 3
+    }
+  }
+}

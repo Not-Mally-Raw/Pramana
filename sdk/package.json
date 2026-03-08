@@ -1,0 +1,32 @@
+{
+  "name": "@pramana/eliza-plugin",
+  "version": "1.0.0",
+  "description": "Pramana on-chain AgentOps plugin for ElizaOS – trace, guard, and report agent actions",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "jest --testPathPattern=src/__tests__",
+    "lint": "eslint src --ext .ts"
+  },
+  "keywords": ["elizaos", "agentops", "blockchain", "ai-safety", "pramana"],
+  "license": "MIT",
+  "dependencies": {
+    "@elizaos/core": "^0.1.0",
+    "axios": "^1.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "jest": "^29.0.0",
+    "@types/jest": "^29.0.0",
+    "ts-jest": "^29.0.0"
+  },
+  "peerDependencies": {
+    "@elizaos/core": ">=0.1.0"
+  }
+}

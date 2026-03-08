@@ -1,0 +1,350 @@
+"""
+core/db.py — SQLite (state/events) + DuckDB (analytics) setup.
+All tables include org_id for multi-tenancy. LRU eviction to 10K rows per org.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Generator
+
+import duckdb
+
+from core.config.settings import get_settings
+
+__all__ = [
+    "get_sqlite_conn",
+    "get_duck_conn",
+    "init_sqlite",
+    "init_duckdb",
+    "evict_old_rows",
+    "upsert_agent",
+    "insert_event",
+    "insert_trace",
+    "upsert_policy",
+    "get_routing_table",
+    "upsert_routing_rule",
+]
+
+# ── SQLite helpers ────────────────────────────────────────────────────────────
+
+_SQLITE_SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE IF NOT EXISTS agents (
+    agent_addr   TEXT NOT NULL,
+    org_id       TEXT NOT NULL,
+    did          TEXT,
+    risk_tier    INTEGER DEFAULT 0,
+    paused       INTEGER DEFAULT 0,
+    reputation   REAL    DEFAULT 0.0,
+    registered_at TEXT,
+    updated_at   TEXT,
+    metadata     TEXT,
+    PRIMARY KEY (agent_addr, org_id)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id       TEXT    NOT NULL,
+    agent_addr   TEXT    NOT NULL,
+    tx_hash      TEXT,
+    action       TEXT,
+    calldata     TEXT,
+    value_wei    TEXT,
+    gas_price    TEXT,
+    network      TEXT,
+    created_at   TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS traces (
+    flow_id      TEXT    PRIMARY KEY,
+    org_id       TEXT    NOT NULL,
+    agent_addr   TEXT    NOT NULL,
+    trace_hash   TEXT,
+    dag_json     TEXT,
+    flag_count   INTEGER DEFAULT 0,
+    risk_score   REAL    DEFAULT 0.0,
+    council_action TEXT,
+    created_at   TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS policies (
+    policy_id    TEXT    PRIMARY KEY,
+    org_id       TEXT    NOT NULL,
+    agent_addr   TEXT    NOT NULL,
+    rules_json   TEXT    NOT NULL,
+    rule_hash    TEXT,
+    version      INTEGER DEFAULT 1,
+    active       INTEGER DEFAULT 1,
+    created_at   TEXT,
+    updated_at   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS routing_table (
+    rule_key     TEXT    PRIMARY KEY,
+    condition    TEXT    NOT NULL,
+    action       TEXT    NOT NULL,
+    priority     INTEGER DEFAULT 5,
+    enabled      INTEGER DEFAULT 1,
+    updated_at   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS reputation_scores (
+    agent_addr     TEXT NOT NULL,
+    org_id         TEXT NOT NULL,
+    success_rate   REAL DEFAULT 0.0,
+    roi_score      REAL DEFAULT 0.0,
+    uptime_score   REAL DEFAULT 0.0,
+    halluc_rate    REAL DEFAULT 0.0,
+    composite      REAL DEFAULT 0.0,
+    tx_count       INTEGER DEFAULT 0,
+    updated_at     TEXT,
+    PRIMARY KEY (agent_addr, org_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_org    ON events(org_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_agent  ON events(agent_addr, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_traces_org    ON traces(org_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_traces_hash   ON traces(trace_hash);
+CREATE INDEX IF NOT EXISTS idx_policies_org  ON policies(org_id, agent_addr);
+"""
+
+
+def _ensure_dir(path: str) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+
+def init_sqlite() -> None:
+    s = get_settings()
+    _ensure_dir(s.SQLITE_PATH)
+    with sqlite3.connect(s.SQLITE_PATH) as conn:
+        conn.executescript(_SQLITE_SCHEMA)
+
+
+@contextmanager
+def get_sqlite_conn() -> Generator[sqlite3.Connection, None, None]:
+    s = get_settings()
+    _ensure_dir(s.SQLITE_PATH)
+    conn = sqlite3.connect(s.SQLITE_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def evict_old_rows(org_id: str, max_rows: int = 10_000) -> None:
+    """Keep at most max_rows per org in events/traces to control disk usage."""
+    with get_sqlite_conn() as conn:
+        for table in ("events", "traces"):
+            conn.execute(
+                f"""
+                DELETE FROM {table}
+                WHERE org_id = ?
+                  AND rowid NOT IN (
+                    SELECT rowid FROM {table}
+                    WHERE org_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                  )
+                """,
+                (org_id, org_id, max_rows),
+            )
+
+
+# ── CRUD helpers ──────────────────────────────────────────────────────────────
+
+def upsert_agent(
+    agent_addr: str,
+    org_id: str,
+    did: str = "",
+    risk_tier: int = 0,
+    paused: bool = False,
+    metadata: dict | None = None,
+) -> None:
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    with get_sqlite_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO agents (agent_addr, org_id, did, risk_tier, paused, metadata, registered_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(agent_addr, org_id) DO UPDATE SET
+                did=excluded.did, risk_tier=excluded.risk_tier,
+                paused=excluded.paused, metadata=excluded.metadata, updated_at=excluded.updated_at
+            """,
+            (agent_addr, org_id, did, risk_tier, int(paused), json.dumps(metadata or {}), now, now),
+        )
+
+
+def insert_event(event_dict: dict) -> None:
+    from datetime import datetime, timezone
+    with get_sqlite_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO events (org_id, agent_addr, tx_hash, action, calldata, value_wei, gas_price, network, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_dict.get("org_id", "default"),
+                event_dict.get("agent_id", ""),
+                event_dict.get("tx_hash", ""),
+                event_dict.get("action", ""),
+                event_dict.get("calldata", ""),
+                str(event_dict.get("value_wei", 0)),
+                str(event_dict.get("gas_price", 0)),
+                event_dict.get("network", "anvil"),
+                event_dict.get("timestamp", datetime.now(timezone.utc).isoformat()),
+            ),
+        )
+
+
+def insert_trace(
+    flow_id: str,
+    org_id: str,
+    agent_addr: str,
+    trace_hash: str,
+    dag_json: str,
+    flag_count: int,
+    risk_score: float,
+    council_action: str,
+) -> None:
+    from datetime import datetime, timezone
+    with get_sqlite_conn() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO traces
+              (flow_id, org_id, agent_addr, trace_hash, dag_json, flag_count, risk_score, council_action, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (flow_id, org_id, agent_addr, trace_hash, dag_json, flag_count, risk_score,
+             council_action, datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def upsert_policy(
+    policy_id: str,
+    org_id: str,
+    agent_addr: str,
+    rules_json: str,
+    rule_hash: str,
+    version: int = 1,
+) -> None:
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    with get_sqlite_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO policies (policy_id, org_id, agent_addr, rules_json, rule_hash, version, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT(policy_id) DO UPDATE SET
+                rules_json=excluded.rules_json, rule_hash=excluded.rule_hash,
+                version=excluded.version, updated_at=excluded.updated_at
+            """,
+            (policy_id, org_id, agent_addr, rules_json, rule_hash, version, now, now),
+        )
+
+
+def get_routing_table() -> dict:
+    """Return {rule_key: {condition, action, priority}} dict for O(1) routing."""
+    with get_sqlite_conn() as conn:
+        rows = conn.execute(
+            "SELECT rule_key, condition, action, priority FROM routing_table WHERE enabled=1 ORDER BY priority DESC"
+        ).fetchall()
+    return {r["rule_key"]: {"condition": r["condition"], "action": r["action"], "priority": r["priority"]} for r in rows}
+
+
+def upsert_routing_rule(rule_key: str, condition: str, action: str, priority: int = 5) -> None:
+    from datetime import datetime, timezone
+    with get_sqlite_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO routing_table (rule_key, condition, action, priority, enabled, updated_at)
+            VALUES (?, ?, ?, ?, 1, ?)
+            ON CONFLICT(rule_key) DO UPDATE SET
+                condition=excluded.condition, action=excluded.action,
+                priority=excluded.priority, updated_at=excluded.updated_at
+            """,
+            (rule_key, condition, action, priority, datetime.now(timezone.utc).isoformat()),
+        )
+
+
+# ── DuckDB helpers ────────────────────────────────────────────────────────────
+
+_DUCKDB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS agent_metrics (
+    agent_addr   VARCHAR NOT NULL,
+    org_id       VARCHAR NOT NULL,
+    window_ts    TIMESTAMP NOT NULL,
+    tx_count     INTEGER,
+    flag_count   INTEGER,
+    avg_gas_gwei DOUBLE,
+    avg_risk     DOUBLE,
+    success_pct  DOUBLE,
+    PRIMARY KEY (agent_addr, org_id, window_ts)
+);
+
+CREATE TABLE IF NOT EXISTS reputation_history (
+    agent_addr   VARCHAR NOT NULL,
+    org_id       VARCHAR NOT NULL,
+    recorded_at  TIMESTAMP NOT NULL,
+    composite    DOUBLE,
+    success_rate DOUBLE,
+    roi_score    DOUBLE,
+    uptime_score DOUBLE,
+    halluc_rate  DOUBLE
+);
+
+CREATE TABLE IF NOT EXISTS council_decisions (
+    flow_id      VARCHAR PRIMARY KEY,
+    agent_addr   VARCHAR,
+    org_id       VARCHAR,
+    decided_at   TIMESTAMP,
+    approved     BOOLEAN,
+    risk_score   DOUBLE,
+    confidence   DOUBLE,
+    action       VARCHAR,
+    reason       VARCHAR
+);
+"""
+
+
+def init_duckdb() -> None:
+    s = get_settings()
+    _ensure_dir(s.DUCKDB_PATH)
+    with duckdb.connect(s.DUCKDB_PATH) as conn:
+        conn.execute(_DUCKDB_SCHEMA)
+
+
+@contextmanager
+def get_duck_conn() -> Generator[duckdb.DuckDBPyConnection, None, None]:
+    s = get_settings()
+    _ensure_dir(s.DUCKDB_PATH)
+    conn = duckdb.connect(s.DUCKDB_PATH)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def query_reputation_window(agent_addr: str, org_id: str, days: int = 30) -> list[dict]:
+    with get_duck_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT recorded_at, composite, success_rate, halluc_rate
+            FROM reputation_history
+            WHERE agent_addr = ? AND org_id = ?
+              AND recorded_at >= now() - INTERVAL (?) DAY
+            ORDER BY recorded_at DESC
+            """,
+            [agent_addr, org_id, days],
+        ).fetchall()
+    return [{"recorded_at": r[0], "composite": r[1], "success_rate": r[2], "halluc_rate": r[3]} for r in rows]
