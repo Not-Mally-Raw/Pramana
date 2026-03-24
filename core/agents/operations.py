@@ -21,26 +21,34 @@ class OperationsAgent(BaseL1Agent):
 
     def check(self, event: ChainEvent, state: PramanaState) -> L1Result:
         s = get_settings()
+        profile = state.agent_profile or "generic"
+        thresholds = s.AGENT_PROFILE_THRESHOLDS.get(profile, s.AGENT_PROFILE_THRESHOLDS["generic"])
+        
         issues: list[str] = []
         score = 0.0
-        meta: dict[str, Any] = {}
+        meta: dict[str, Any] = {
+            "profile": profile,
+            "thresholds_applied": thresholds,
+        }
 
-        # ── Action frequency (loop detection) ──────────────────────────────
+        # ── Action frequency (loop detection) by profile ──────────────────────
         actions_per_min = self._count_recent_actions(event.agent_id, event.org_id, window_s=60)
+        action_loop_threshold = thresholds["ACTION_LOOP_PER_MIN"]
         meta["actions_per_min"] = actions_per_min
-        if actions_per_min >= s.ACTION_LOOP_PER_MIN:
-            issues.append(f"action loop: {actions_per_min} actions/min (threshold {s.ACTION_LOOP_PER_MIN})")
-            score = max(score, min(0.5 + (actions_per_min - s.ACTION_LOOP_PER_MIN) * 0.05, 1.0))
+        if actions_per_min >= action_loop_threshold:
+            issues.append(f"action loop: {actions_per_min} actions/min (threshold {action_loop_threshold})")
+            score = max(score, min(0.5 + (actions_per_min - action_loop_threshold) * 0.05, 1.0))
 
-        # ── Balance drain detection ─────────────────────────────────────────
+        # ── Balance drain detection by profile ────────────────────────────────
         value_eth = event.value_wei / 1e18 if event.value_wei else 0.0
         recent_eth_out = self._sum_recent_value(event.agent_id, event.org_id, window_s=300)
+        balance_drain_threshold = thresholds["BALANCE_DRAIN_PCT"]
         meta["recent_eth_out_5min"] = round(recent_eth_out, 6)
         meta["current_value_eth"] = round(value_eth, 6)
+        meta["balance_drain_threshold"] = balance_drain_threshold
 
-        # Balance drain signal: agent sent > 10% of typical daily amount in 5 min
-        if recent_eth_out > s.BALANCE_DRAIN_PCT:
-            issues.append(f"balance drain: {recent_eth_out:.4f} ETH in 5min")
+        if recent_eth_out > balance_drain_threshold:
+            issues.append(f"balance drain: {recent_eth_out:.4f} ETH in 5min (threshold {balance_drain_threshold})")
             score = max(score, 0.75)
 
         # ── Same action repeated (short loop variant) ──────────────────────
@@ -103,6 +111,12 @@ class OperationsAgent(BaseL1Agent):
 
     @staticmethod
     def _sum_recent_value(agent_addr: str, org_id: str, window_s: int) -> float:
+        """Sum recent value_wei for balance drain detection.
+
+        Fix 7: The old code used r[0].isdigit() which fails for negative
+        numbers, decimal strings, large wei values, and non-string types.
+        Replaced with try/float for robust numeric parsing.
+        """
         try:
             from core.db import get_sqlite_conn
             with get_sqlite_conn() as conn:
@@ -112,7 +126,14 @@ class OperationsAgent(BaseL1Agent):
                          AND created_at >= datetime('now', '-' || ? || ' seconds')""",
                     (agent_addr, org_id, window_s),
                 ).fetchall()
-            total_wei = sum(int(r[0]) for r in rows if r[0] and r[0].isdigit())
+            total_wei = 0
+            for r in rows:
+                if r[0] is None:
+                    continue
+                try:
+                    total_wei += int(float(r[0]))
+                except (ValueError, TypeError):
+                    continue
             return total_wei / 1e18
         except Exception:
             return 0.0

@@ -48,7 +48,6 @@ def keccak256_hex(data: str | bytes) -> str:
     if isinstance(data, str):
         data = data.encode("utf-8")
     try:
-        import sha3  # pysha3 package
         k = hashlib.new("keccak_256")
         k.update(data)
         return k.hexdigest()
@@ -75,7 +74,7 @@ def hex_to_bytes32_param(hex_str: str) -> str:
 
 # ─── Fingerprinting ───────────────────────────────────────────────────────────
 
-def action_fingerprint(agent_id: int, action: str, calldata: str) -> str:
+def action_fingerprint(agent_id: str, action: str, calldata: str) -> str:
     """
     Create a stable fingerprint for (agent, action) used as LLM cache key.
     Truncates calldata to first 64 chars to reduce noise from value differences.
@@ -88,6 +87,19 @@ def action_fingerprint(agent_id: int, action: str, calldata: str) -> str:
 def policy_hash(rules_json: str) -> str:
     """keccak256 of the policy rules JSON — matches Solidity Guardian.setPolicy()."""
     return keccak256_hex(rules_json)
+
+
+def eth_address_to_uint256(address: str) -> int:
+    """Convert an EVM address string to deterministic uint256 identity."""
+    s = (address or "").strip().lower()
+    if s.startswith("0x"):
+        s = s[2:]
+    if len(s) != 40:
+        return 0
+    try:
+        return int(s, 16)
+    except ValueError:
+        return 0
 
 
 # ─── Merkle Root (lightweight, for batch SBT updates) ────────────────────────

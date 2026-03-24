@@ -25,7 +25,7 @@ class TraceDAG:
     Thread-safety: instances are created per-flow, never shared across threads.
     """
 
-    def __init__(self, flow_id: str, agent_id: int, org_id: str) -> None:
+    def __init__(self, flow_id: str, agent_id: str, org_id: str) -> None:
         self.flow_id  = flow_id
         self.agent_id = agent_id
         self.org_id   = org_id
@@ -38,7 +38,6 @@ class TraceDAG:
     def add_node(
         self,
         name: str,
-        *,
         action: str = "",
         score: float = 0.0,
         flagged: bool = False,
@@ -62,13 +61,49 @@ class TraceDAG:
         self,
         from_node: str,
         to_node: str,
-        payload: str = "",
+        payload: Any = "",
     ) -> None:
         """Add a directed edge representing an agent hand-off.
         payload is hashed (SHA-256) and stored as edge attribute — not raw data.
         """
-        payload_hash = hashlib.sha256(payload.encode()).hexdigest() if payload else ""
-        self._g.add_edge(from_node, to_node, data_hash=payload_hash)
+        src = self._resolve_node_ref(from_node)
+        dst = self._resolve_node_ref(to_node)
+
+        if isinstance(payload, str):
+            payload_str = payload
+        elif payload is None:
+            payload_str = ""
+        else:
+            payload_str = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+        payload_hash = hashlib.sha256(payload_str.encode()).hexdigest() if payload_str else ""
+        self._g.add_edge(src, dst, data_hash=payload_hash)
+
+    def _resolve_node_ref(self, node_ref: str) -> str:
+        """Resolve a node reference by ID first, then by agent name.
+
+        If multiple nodes share the same name, select the latest step.
+        """
+        if node_ref in self._g:
+            return node_ref
+
+        matches: list[tuple[int, str]] = []
+        for nid, attrs in self._g.nodes(data=True):
+            if attrs.get("name") != node_ref:
+                continue
+            step = -1
+            if ":" in nid:
+                try:
+                    step = int(nid.rsplit(":", 1)[1])
+                except ValueError:
+                    step = -1
+            matches.append((step, nid))
+
+        if matches:
+            matches.sort(key=lambda x: x[0])
+            return matches[-1][1]
+
+        return node_ref
 
     # ─── Serialization ────────────────────────────────────────────────────────
 

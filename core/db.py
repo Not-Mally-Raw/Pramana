@@ -26,6 +26,8 @@ __all__ = [
     "upsert_policy",
     "get_routing_table",
     "upsert_routing_rule",
+    "insert_agent_metric",
+    "insert_council_decision",
 ]
 
 # ── SQLite helpers ────────────────────────────────────────────────────────────
@@ -38,6 +40,7 @@ CREATE TABLE IF NOT EXISTS agents (
     agent_addr   TEXT NOT NULL,
     org_id       TEXT NOT NULL,
     did          TEXT,
+    agent_profile TEXT DEFAULT 'generic',
     risk_tier    INTEGER DEFAULT 0,
     paused       INTEGER DEFAULT 0,
     reputation   REAL    DEFAULT 0.0,
@@ -123,6 +126,41 @@ def init_sqlite() -> None:
     _ensure_dir(s.SQLITE_PATH)
     with sqlite3.connect(s.SQLITE_PATH) as conn:
         conn.executescript(_SQLITE_SCHEMA)
+        _seed_routing_rules(conn)
+
+
+def _seed_routing_rules(conn: sqlite3.Connection) -> None:
+    """Seed routing_table from config file on first init (idempotent)."""
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM routing_table").fetchone()
+        if row and int(row[0]) > 0:
+            return
+
+        rules_path = Path(__file__).parent / "config" / "routing_rules.json"
+        if not rules_path.exists():
+            return
+
+        data = json.loads(rules_path.read_text(encoding="utf-8"))
+        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+
+        for section in ("escalation_rules", "pass_rules"):
+            for rule_key, rule in (data.get(section, {}) or {}).items():
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO routing_table (rule_key, condition, action, priority, enabled, updated_at)
+                    VALUES (?, ?, ?, ?, 1, ?)
+                    """,
+                    (
+                        rule_key,
+                        str(rule.get("condition", "")),
+                        str(rule.get("action", "pass")),
+                        int(rule.get("priority", 5)),
+                        now,
+                    ),
+                )
+    except Exception:
+        # Startup should not fail if seed config is malformed.
+        pass
 
 
 @contextmanager
@@ -166,6 +204,7 @@ def upsert_agent(
     agent_addr: str,
     org_id: str,
     did: str = "",
+    agent_profile: str = "generic",
     risk_tier: int = 0,
     paused: bool = False,
     metadata: dict | None = None,
@@ -175,14 +214,24 @@ def upsert_agent(
     with get_sqlite_conn() as conn:
         conn.execute(
             """
-            INSERT INTO agents (agent_addr, org_id, did, risk_tier, paused, metadata, registered_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO agents (agent_addr, org_id, did, agent_profile, risk_tier, paused, metadata, registered_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(agent_addr, org_id) DO UPDATE SET
-                did=excluded.did, risk_tier=excluded.risk_tier,
+                did=excluded.did, agent_profile=excluded.agent_profile, risk_tier=excluded.risk_tier,
                 paused=excluded.paused, metadata=excluded.metadata, updated_at=excluded.updated_at
             """,
-            (agent_addr, org_id, did, risk_tier, int(paused), json.dumps(metadata or {}), now, now),
+            (agent_addr, org_id, did, agent_profile, risk_tier, int(paused), json.dumps(metadata or {}), now, now),
         )
+
+
+def get_agent_profile(agent_addr: str, org_id: str) -> str:
+    """Fetch agent's profile, default to 'generic'."""
+    with get_sqlite_conn() as conn:
+        row = conn.execute(
+            "SELECT agent_profile FROM agents WHERE agent_addr=? AND org_id=?",
+            (agent_addr, org_id)
+        ).fetchone()
+    return row[0] if row else "generic"
 
 
 def insert_event(event_dict: dict) -> None:
@@ -348,3 +397,107 @@ def query_reputation_window(agent_addr: str, org_id: str, days: int = 30) -> lis
             [agent_addr, org_id, days],
         ).fetchall()
     return [{"recorded_at": r[0], "composite": r[1], "success_rate": r[2], "halluc_rate": r[3]} for r in rows]
+
+
+def insert_agent_metric(
+    agent_addr: str,
+    org_id: str,
+    risk_score: float,
+    flag_count: int,
+    avg_gas_gwei: float,
+    success_pct: float,
+) -> None:
+    """Upsert minute-window metrics for analytics/reputation feedback loop."""
+    from datetime import datetime, timezone
+
+    window_ts = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    with get_duck_conn() as conn:
+        current = conn.execute(
+            """
+            SELECT tx_count, flag_count, avg_gas_gwei, avg_risk, success_pct
+            FROM agent_metrics WHERE agent_addr=? AND org_id=? AND window_ts=?
+            """,
+            [agent_addr, org_id, window_ts],
+        ).fetchone()
+
+        if not current:
+            conn.execute(
+                """
+                INSERT INTO agent_metrics
+                  (agent_addr, org_id, window_ts, tx_count, flag_count, avg_gas_gwei, avg_risk, success_pct)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    agent_addr,
+                    org_id,
+                    window_ts,
+                    1,
+                    int(flag_count),
+                    float(avg_gas_gwei),
+                    float(risk_score),
+                    max(0.0, min(float(success_pct), 1.0)),
+                ],
+            )
+            return
+
+        old_tx, old_flags, old_gas, old_risk, old_success = current
+        old_tx = int(old_tx or 0)
+        new_tx = old_tx + 1
+
+        def _avg(old_val: float, new_val: float) -> float:
+            return ((float(old_val or 0.0) * old_tx) + float(new_val)) / max(new_tx, 1)
+
+        conn.execute(
+            """
+            UPDATE agent_metrics
+            SET tx_count=?,
+                flag_count=?,
+                avg_gas_gwei=?,
+                avg_risk=?,
+                success_pct=?
+            WHERE agent_addr=? AND org_id=? AND window_ts=?
+            """,
+            [
+                new_tx,
+                int(old_flags or 0) + int(flag_count),
+                _avg(float(old_gas or 0.0), float(avg_gas_gwei)),
+                _avg(float(old_risk or 0.0), float(risk_score)),
+                _avg(float(old_success or 0.0), max(0.0, min(float(success_pct), 1.0))),
+                agent_addr,
+                org_id,
+                window_ts,
+            ],
+        )
+
+
+def insert_council_decision(
+    flow_id: str,
+    agent_addr: str,
+    org_id: str,
+    approved: bool,
+    risk_score: float,
+    confidence: float,
+    action: str,
+    reason: str,
+) -> None:
+    from datetime import datetime, timezone
+
+    with get_duck_conn() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO council_decisions
+              (flow_id, agent_addr, org_id, decided_at, approved, risk_score, confidence, action, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                flow_id,
+                agent_addr,
+                org_id,
+                datetime.now(timezone.utc),
+                bool(approved),
+                float(risk_score),
+                float(confidence),
+                str(action),
+                str(reason)[:512],
+            ],
+        )

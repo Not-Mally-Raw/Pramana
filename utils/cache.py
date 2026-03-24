@@ -81,17 +81,17 @@ _policy_cache: TTLCache = TTLCache(maxsize=128, ttl=60)
 _policy_lock  = threading.Lock()
 
 
-def get_policy_cache(agent_id: int, org_id: str) -> Any | None:
+def get_policy_cache(agent_id: str, org_id: str) -> Any | None:
     with _policy_lock:
         return _policy_cache.get((agent_id, org_id))
 
 
-def set_policy_cache(agent_id: int, org_id: str, policy: Any) -> None:
+def set_policy_cache(agent_id: str, org_id: str, policy: Any) -> None:
     with _policy_lock:
         _policy_cache[(agent_id, org_id)] = policy
 
 
-def invalidate_policy_cache(agent_id: int, org_id: str) -> None:
+def invalidate_policy_cache(agent_id: str, org_id: str) -> None:
     with _policy_lock:
         _policy_cache.pop((agent_id, org_id), None)
 
@@ -114,18 +114,19 @@ def set_oracle_cache(key: str, value: Any) -> None:
 
 # ─── Embedding Cache ──────────────────────────────────────────────────────────
 # Chroma similarity results per (agent_id, text_hash). TTL=5min, LRU 512.
-_embed_cache: TTLCache = TTLCache(maxsize=512, ttl=300)
+# EMBEDDING_CACHE is exposed for direct dict-style access by agents.
 _embed_lock  = threading.Lock()
+EMBEDDING_CACHE: TTLCache = TTLCache(maxsize=512, ttl=300)
 
 
-def get_embed_cache(agent_id: int, text_hash: str) -> float | None:
+def get_embed_cache(agent_id: str, text_hash: str) -> float | None:
     with _embed_lock:
-        return _embed_cache.get((agent_id, text_hash))
+        return EMBEDDING_CACHE.get((agent_id, text_hash))
 
 
-def set_embed_cache(agent_id: int, text_hash: str, score: float) -> None:
+def set_embed_cache(agent_id: str, text_hash: str, score: float) -> None:
     with _embed_lock:
-        _embed_cache[(agent_id, text_hash)] = score
+        EMBEDDING_CACHE[(agent_id, text_hash)] = score
 
 
 # ─── Rate Limit Tracker ───────────────────────────────────────────────────────

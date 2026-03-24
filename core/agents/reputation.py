@@ -158,14 +158,24 @@ class ReputationAgent:
             ]""")
             contract = w3.eth.contract(address=s.SBT_ADDR, abi=abi)
 
-            # Build arrays (token IDs = sequential 1..N for simplicity)
-            token_ids = list(range(1, len(reps) + 1))
+            # Fix 5: Look up actual token IDs from SBT contract instead of
+            # using positional range(1, N). The old code corrupted scores
+            # whenever the agent list changed order or an agent was removed.
+            token_id_map = self._get_agent_token_ids(reps, w3, s.SBT_ADDR)
+            valid_reps = [(r, tid) for r in reps if (tid := token_id_map.get(r.agent_addr)) is not None]
+
+            if not valid_reps:
+                return
+
+            token_ids = [tid for _, tid in valid_reps]
+            valid_rep_objs = [r for r, _ in valid_reps]
+
             fn = contract.functions.batchUpdateScores(
                 token_ids,
-                [int(r.success_rate * 1000) for r in reps],
-                [int(r.roi_score * 1000)    for r in reps],
-                [int(r.uptime_score * 1000) for r in reps],
-                [int(r.halluc_rate * 1000)  for r in reps],
+                [int(r.success_rate * 1000) for r in valid_rep_objs],
+                [int(r.roi_score * 1000)    for r in valid_rep_objs],
+                [int(r.uptime_score * 1000) for r in valid_rep_objs],
+                [int(r.halluc_rate * 1000)  for r in valid_rep_objs],
             )
             acct = w3.eth.account.from_key(s.DEPLOYER_KEY)
             tx = fn.build_transaction({
@@ -189,3 +199,27 @@ class ReputationAgent:
             return [r[0] for r in rows]
         except Exception:
             return []
+
+    @staticmethod
+    def _get_agent_token_ids(reps, w3, sbt_addr: str) -> dict[str, int]:
+        """Look up SBT token IDs for each agent address via on-chain tokenOf().
+
+        Fix 5: The old code used range(1, N) which silently wrote scores to
+        wrong agents whenever the list order changed or agents were added/removed.
+        """
+        import json
+        token_of_abi = json.loads("""[
+          {"inputs":[{"name":"","type":"address"}],
+           "name":"tokenOf","outputs":[{"name":"","type":"uint256"}],
+           "stateMutability":"view","type":"function"}
+        ]""")
+        sbt = w3.eth.contract(address=sbt_addr, abi=token_of_abi)
+        result = {}
+        for r in reps:
+            try:
+                tid = sbt.functions.tokenOf(r.agent_addr).call()
+                if tid > 0:
+                    result[r.agent_addr] = tid
+            except Exception:
+                continue  # Agent not minted yet, skip
+        return result

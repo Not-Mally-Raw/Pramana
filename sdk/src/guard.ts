@@ -57,9 +57,31 @@ export class PramanaGuard {
     } catch (err) {
       if (err instanceof PramanaBlockedError) throw err;
 
-      // Guard API unavailable → fail open (don't block agent on infra failure)
-      console.warn("[Pramana] Guard check unavailable:", err instanceof Error ? err.message : String(err));
-      return { allowed: true, score: 0.0, reason: "guard unavailable (fail open)", patterns: [] };
+      const mode = this.config.guardFailMode ?? "fail_open";
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[Pramana] Guard check unavailable:", msg);
+
+      if (mode === "fail_closed") {
+        const result: GuardCheckResponse = {
+          allowed: false,
+          score: 1.0,
+          reason: "guard unavailable (fail closed)",
+          patterns: [],
+          fail_mode: "fail_closed",
+        };
+        throw new PramanaBlockedError(
+          `Action blocked by Pramana guard: ${result.reason}`,
+          result
+        );
+      }
+
+      return {
+        allowed: true,
+        score: 0.0,
+        reason: "guard unavailable (fail open)",
+        patterns: [],
+        fail_mode: "fail_open",
+      };
     }
   }
 }

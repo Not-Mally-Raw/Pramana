@@ -48,17 +48,32 @@ class DriftMonitorAgent(BaseL1Agent):
         return self._make_result(self.name, False, 0.0, "behavior within baseline", meta)
 
     def verify(self, event: ChainEvent, state: PramanaState, first: L1Result) -> L1Result:
-        """Second pass: compare against rolling 10-tx window instead of full baseline."""
+        """Second pass: compare against rolling N-tx window (profile-aware).
+
+        Fix 11: Window size is now per-profile via DRIFT_WINDOW_TXS.
+        arb_bot uses 100, treasury_bot uses 10, etc.
+        """
+        s = get_settings()
         meta = dict(first.metadata)
         behavior_text = f"{event.action} {(event.calldata or '')[:256]}"
-        rolling_sim = self._rolling_similarity(event.agent_id, event.org_id, behavior_text)
-        meta["rolling_similarity_10tx"] = round(rolling_sim, 4)
+
+        # Load profile-aware drift window size
+        profile = state.agent_profile or "generic"
+        thresholds = s.AGENT_PROFILE_THRESHOLDS.get(profile, s.AGENT_PROFILE_THRESHOLDS["generic"])
+        drift_window = thresholds.get("DRIFT_WINDOW_TXS", 10)
+        meta["drift_window_txs"] = drift_window
+
+        rolling_sim = self._rolling_similarity(
+            event.agent_id, event.org_id, behavior_text, window=drift_window
+        )
+        meta["rolling_similarity"] = round(rolling_sim, 4)
 
         if rolling_sim < 0.60:
             return self._make_result(
                 self.name, True,
                 min(first.score + 0.10, 1.0),
-                first.reason + f" (rolling sim {rolling_sim:.3f})", meta, pass_count=2
+                first.reason + f" (rolling sim {rolling_sim:.3f}, window={drift_window})",
+                meta, pass_count=2
             )
         return self._make_result(
             self.name, first.flagged,
@@ -112,8 +127,11 @@ class DriftMonitorAgent(BaseL1Agent):
             pass
 
     @staticmethod
-    def _rolling_similarity(agent_id: str, org_id: str, text: str) -> float:
-        """Compare vs last 10 stored embeddings (most recent behavior window)."""
+    def _rolling_similarity(agent_id: str, org_id: str, text: str, window: int = 10) -> float:
+        """Compare vs last N stored embeddings (profile-aware window).
+
+        Fix 11: Window size is now parameterized via DRIFT_WINDOW_TXS.
+        """
         try:
             import chromadb
             from core.config.settings import get_settings as _gs
@@ -123,7 +141,7 @@ class DriftMonitorAgent(BaseL1Agent):
                 f"baseline_{agent_id}_{org_id}",
                 metadata={"hnsw:space": "cosine"},
             )
-            n = min(col.count(), 10)
+            n = min(col.count(), window)
             if n == 0:
                 return 0.85
             results = col.query(query_texts=[text], n_results=n)

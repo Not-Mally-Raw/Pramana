@@ -33,11 +33,18 @@ class NetworkAgent(BaseL1Agent):
         gas_gwei = event.gas_price / 1e9 if event.gas_price else 0.0
         meta["gas_gwei"] = round(gas_gwei, 2)
 
-        # ── Gas spike detection ─────────────────────────────────────────────
+        # ── Gas spike detection (profile-aware) ─────────────────────────────
+        # Fix 11: Load per-profile GAS_SPIKE_MULTIPLIER instead of static global
+        profile = state.agent_profile or "generic"
+        thresholds = s.AGENT_PROFILE_THRESHOLDS.get(profile, s.AGENT_PROFILE_THRESHOLDS["generic"])
+        gas_spike_mult = thresholds.get("GAS_SPIKE_MULTIPLIER", s.GAS_SPIKE_MULTIPLIER)
+
         avg_gas = self._get_avg_gas(event.agent_id, event.org_id)
         meta["avg_gas_gwei"] = round(avg_gas, 2)
+        meta["gas_spike_multiplier"] = gas_spike_mult
+        meta["profile"] = profile
 
-        if avg_gas > 0 and gas_gwei > avg_gas * s.GAS_SPIKE_MULTIPLIER:
+        if avg_gas > 0 and gas_gwei > avg_gas * gas_spike_mult:
             spike_ratio = gas_gwei / avg_gas
             issues.append(f"gas spike {spike_ratio:.1f}x avg ({gas_gwei:.0f} vs {avg_gas:.0f} gwei)")
             score = max(score, min(0.5 + (spike_ratio - 2.0) * 0.1, 1.0))
@@ -78,15 +85,23 @@ class NetworkAgent(BaseL1Agent):
 
     @staticmethod
     def _get_avg_gas(agent_addr: str, org_id: str) -> float:
-        """Compute rolling average gas from DuckDB. Returns 0 if insufficient data."""
+        """Compute rolling average gas from DuckDB over last N metric windows.
+
+        Fix 3: The old query applied ORDER BY + LIMIT after AVG() aggregation,
+        making the LIMIT meaningless (AVG produces one row). Rewritten as a
+        subquery that selects the most recent N rows first, then averages them.
+        """
         try:
             from core.db import get_duck_conn
             with get_duck_conn() as conn:
                 row = conn.execute(
                     """
-                    SELECT AVG(avg_gas_gwei) FROM agent_metrics
-                    WHERE agent_addr = ? AND org_id = ?
-                    ORDER BY window_ts DESC LIMIT ?
+                    SELECT AVG(avg_gas_gwei) FROM (
+                        SELECT avg_gas_gwei FROM agent_metrics
+                        WHERE agent_addr = ? AND org_id = ?
+                        ORDER BY window_ts DESC
+                        LIMIT ?
+                    ) AS recent
                     """,
                     [agent_addr, org_id, _GAS_HISTORY_WINDOW],
                 ).fetchone()

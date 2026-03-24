@@ -78,6 +78,7 @@ export interface PramanaConfig {
   agentId: string;
   enabled?: boolean;    // default: true
   guardEnabled?: boolean; // default: true — block on injection detection
+  guardFailMode?: "fail_open" | "fail_closed"; // default: fail_open
   traceEnabled?: boolean; // default: true — emit traces to API
 }
 
@@ -95,6 +96,8 @@ export interface GuardCheckResponse {
   score: number;
   reason: string;
   patterns: string[];
+  threshold?: number;
+  fail_mode?: "fail_open" | "fail_closed";
 }
 
 export interface ApiResponse<T = unknown> {

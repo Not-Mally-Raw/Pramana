@@ -49,9 +49,31 @@ class HallucinationAgent(BaseL1Agent):
         # ── Chroma vector similarity ────────────────────────────────────────
         # DegradedMode.NO_VECTORS → skip vector check
         if state.degraded_mode and "NO_VECTORS" in str(state.degraded_mode):
-            return self._make_result(self.name, False, 0.0, "vector check skipped (degraded)", meta)
+            meta["vector_unavailable"] = True
+            return self._make_result(
+                self.name,
+                False,
+                min(0.25, s.HALLUC_SCORE_THRESHOLD * 0.5),
+                "vector check skipped (degraded)",
+                meta,
+                pass_count=0,
+            )
 
         similarity = self._chroma_similarity(event.agent_id, event.org_id, event.calldata or "")
+        if similarity is None:
+            # Fix 9: Cold-start now flags conservatively instead of passing.
+            # New agents with no baseline should be escalated, not trusted.
+            meta["vector_unavailable"] = True
+            meta["warmup"] = True
+            return self._make_result(
+                self.name,
+                True,   # was: False — silently passed new agents
+                0.50,   # was: 0.25 — too permissive
+                "warmup_period: no vector baseline established",
+                meta,
+                pass_count=1,
+            )
+
         meta["chroma_similarity"] = round(similarity, 4)
 
         # Low similarity → output deviates from baseline behavior
@@ -85,8 +107,8 @@ class HallucinationAgent(BaseL1Agent):
     # ── Internals ─────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _chroma_similarity(agent_id: str, org_id: str, text: str) -> float:
-        """Query ChromaDB for cosine similarity vs baseline corpus. Returns 0.5 on error."""
+    def _chroma_similarity(agent_id: str, org_id: str, text: str) -> float | None:
+        """Query ChromaDB for cosine similarity vs baseline corpus. Returns None when unavailable."""
         from utils.cache import EMBEDDING_CACHE
         cache_key = f"{agent_id}:{hash(text[:256])}"
         if cache_key in EMBEDDING_CACHE:
@@ -101,14 +123,16 @@ class HallucinationAgent(BaseL1Agent):
                 metadata={"hnsw:space": "cosine"},
             )
             if col.count() == 0:
-                return 0.75  # no baseline yet → assume ok
+                return None
             results = col.query(query_texts=[text[:512]], n_results=1)
             distances = results.get("distances", [[]])[0]
-            similarity = 1.0 - distances[0] if distances else 0.75
+            if not distances:
+                return None
+            similarity = 1.0 - distances[0]
             EMBEDDING_CACHE[cache_key] = similarity
             return similarity
         except Exception:
-            return 0.75  # fail safe → assume ok
+            return None
 
     @staticmethod
     def _historical_success_rate(agent_addr: str, org_id: str, action: str) -> float:
@@ -123,6 +147,6 @@ class HallucinationAgent(BaseL1Agent):
                     """,
                     [agent_addr, org_id],
                 ).fetchone()
-            return float(row[0]) if row and row[0] is not None else 0.75
+            return float(row[0]) if row and row[0] is not None else 0.5
         except Exception:
-            return 0.75
+            return 0.5

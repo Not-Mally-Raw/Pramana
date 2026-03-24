@@ -40,7 +40,7 @@ click>=8.1.0
 # ── Utilities ────────────────────────────────────────────────────────────────
 requests>=2.31.0
 python-dotenv>=1.0.0
-pysha3>=1.0.2     # keccak256 (optional, falls back to hashlib.sha3_256)
+# pysha3 removed — not compatible with Python 3.12; hashlib.sha3_256 used as fallback
 
 # ── Testing ───────────────────────────────────────────────────────────────────
 pytest>=8.2.0

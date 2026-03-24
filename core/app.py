@@ -38,9 +38,38 @@ async def lifespan(app: FastAPI):
     init_sqlite()
     init_duckdb()
     start_scheduler()
+
+    listener = None
+    listener_task = None
+    cfg = get_settings()
+    if cfg.LISTENER_ENABLED:
+        try:
+            from core.flow import PramanaFlow
+            from core.listener import ChainListener
+            from utils.models import PramanaState
+
+            async def _on_chain_event(event):
+                loop = asyncio.get_running_loop()
+                flow = PramanaFlow()
+                await loop.run_in_executor(None, lambda: flow.kickoff(inputs={"event": event.model_dump()}))
+
+            listener = ChainListener(on_event=_on_chain_event, org_id=cfg.DEFAULT_ORG_ID)
+            listener_task = asyncio.create_task(listener.start())
+            logger.info("Chain listener started")
+        except Exception as e:
+            logger.warning("Listener startup failed: %s", e)
+
     logger.info("Pramana API started")
     yield
     # Shutdown
+    if listener is not None:
+        listener.stop()
+    if listener_task is not None:
+        listener_task.cancel()
+        try:
+            await listener_task
+        except asyncio.CancelledError:
+            pass
     stop_scheduler()
     logger.info("Pramana API stopped")
 
@@ -105,6 +134,7 @@ async def health_detailed():
 class RegisterAgentRequest(BaseModel):
     agent_addr: str
     did: str = ""
+    agent_profile: str = "generic"  # Step 1: treasury_bot | keeper_bot | arb_bot | rebalancer | generic
     metadata: dict = {}
 
 
@@ -113,8 +143,12 @@ async def register_agent(req: RegisterAgentRequest, x_org_id: str | None = Heade
     org = _org_id(x_org_id)
     if not req.agent_addr.startswith("0x") or len(req.agent_addr) != 42:
         raise HTTPException(status_code=400, detail="Invalid agent address")
-    upsert_agent(req.agent_addr, org, req.did, metadata=req.metadata)
-    return ApiResponse(status="created", data={"agent_addr": req.agent_addr, "org_id": org})
+    upsert_agent(req.agent_addr, org, req.did, agent_profile=req.agent_profile, metadata=req.metadata)
+    return ApiResponse(status="created", data={
+        "agent_addr": req.agent_addr,
+        "org_id": org,
+        "agent_profile": req.agent_profile
+    })
 
 
 @app.get("/agents/{agent_addr}", response_model=ApiResponse)
@@ -235,30 +269,61 @@ async def guard_check(req: GuardRequest):
     from core.agents.injection import InjectionAgent
     from utils.models import ChainEvent, PramanaState
 
-    event = ChainEvent(
-        agent_id=req.agent_id,
-        org_id=req.org_id,
-        tx_hash="",
-        action=req.action,
-        calldata=req.calldata,
-        value_wei=req.value_wei,
-        gas_price=req.gas_price,
-        network="guard_check",
-    )
-    dummy_state = PramanaState(event=event, degraded_mode=DegradedMode.NORMAL)
-    agent = InjectionAgent()
-    result = agent.run(event, dummy_state)
+    cfg = get_settings()
+    fail_mode = (cfg.GUARD_FAIL_MODE or "fail_open").lower()
+    threshold = float(cfg.GUARD_BLOCK_THRESHOLD)
 
-    allowed = not result.flagged or result.score < 0.70
-    return ApiResponse(
-        status="ok",
-        data={
-            "allowed": allowed,
-            "score": result.score,
-            "reason": result.reason,
-            "patterns": result.metadata.get("matched_patterns", []),
-        },
-    )
+    try:
+        event = ChainEvent(
+            agent_id=req.agent_id,
+            org_id=req.org_id,
+            tx_hash="",
+            action=req.action,
+            calldata=req.calldata,
+            value_wei=req.value_wei,
+            gas_price=req.gas_price,
+            network="guard_check",
+        )
+        dummy_state = PramanaState(event=event, degraded_mode=DegradedMode.NORMAL)
+        agent = InjectionAgent()
+        result = agent.run(event, dummy_state)
+
+        allowed = (not result.flagged) or (result.score < threshold)
+        return ApiResponse(
+            status="ok",
+            data={
+                "allowed": allowed,
+                "score": result.score,
+                "reason": result.reason,
+                "patterns": result.metadata.get("matched_patterns", []),
+                "threshold": threshold,
+                "fail_mode": fail_mode,
+            },
+        )
+    except Exception as e:
+        if fail_mode == "fail_closed":
+            return ApiResponse(
+                status="ok",
+                data={
+                    "allowed": False,
+                    "score": 1.0,
+                    "reason": f"guard unavailable (fail closed): {str(e)[:120]}",
+                    "patterns": [],
+                    "threshold": threshold,
+                    "fail_mode": fail_mode,
+                },
+            )
+        return ApiResponse(
+            status="ok",
+            data={
+                "allowed": True,
+                "score": 0.0,
+                "reason": "guard unavailable (fail open)",
+                "patterns": [],
+                "threshold": threshold,
+                "fail_mode": fail_mode,
+            },
+        )
 
 
 # ── Event ingest (for testing / simulation) ────────────────────────────────
@@ -284,18 +349,37 @@ async def ingest_event(req: IngestRequest):
     state = PramanaState(event=event, degraded_mode=DegradedMode.NORMAL)
 
     flow = PramanaFlow()
-    # kickoff returns final state
-    result_state = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: flow.kickoff(inputs={"event": event.model_dump()})
-    )
+    try:
+        # kickoff can block if a downstream dependency stalls; protect API latency.
+        result_state = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, lambda: flow.kickoff(inputs={"event": event.model_dump()})
+            ),
+            timeout=25,
+        )
+    except asyncio.TimeoutError:
+        return ApiResponse(
+            status="accepted",
+            data={
+                "flow_id": state.flow_id,
+                "action": str(state.action),
+                "flag_count": state.flag_count,
+                "risk_score": state.risk_score,
+                "trace_hash": state.trace_hash,
+                "note": "flow execution timed out at API layer",
+            },
+        )
+
+    # Prefer explicit return value, then flow.state, then local fallback.
+    final = result_state if isinstance(result_state, PramanaState) else (flow.state if hasattr(flow, "state") else state)
 
     return ApiResponse(
         status="ok",
         data={
-            "flow_id": state.flow_id,
-            "action": str(state.action),
-            "flag_count": state.flag_count,
-            "risk_score": state.risk_score,
-            "trace_hash": state.trace_hash,
+            "flow_id": final.flow_id,
+            "action": str(final.action),
+            "flag_count": final.flag_count,
+            "risk_score": final.risk_score,
+            "trace_hash": final.trace_hash,
         },
     )

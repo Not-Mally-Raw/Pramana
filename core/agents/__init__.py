@@ -4,6 +4,7 @@ core/agents/__init__.py — Export all agents.
 from core.agents.base import BaseL1Agent
 from core.agents.council import CouncilAgent
 from core.agents.drift import DriftMonitorAgent
+from core.agents.economic_sanity import EconomicSanityAgent
 from core.agents.hallucination import HallucinationAgent
 from core.agents.injection import InjectionAgent
 from core.agents.network import NetworkAgent
@@ -19,6 +20,7 @@ __all__ = [
     "HallucinationAgent",
     "InjectionAgent",
     "ValidatorAgent",
+    "EconomicSanityAgent",
     "DriftMonitorAgent",
     "CouncilAgent",
     "RecoveryAgent",

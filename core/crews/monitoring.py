@@ -9,6 +9,7 @@ from utils.models import ChainEvent, L1Result, PramanaState
 
 from core.agents import (
     DriftMonitorAgent,
+    EconomicSanityAgent,
     HallucinationAgent,
     InjectionAgent,
     NetworkAgent,
@@ -25,6 +26,7 @@ _AGENT_ORDER = [
     HallucinationAgent(),
     InjectionAgent(),
     ValidatorAgent(),
+    EconomicSanityAgent(),
     DriftMonitorAgent(),
 ]
 

@@ -14,6 +14,7 @@ export interface PramanaPluginOptions {
   orgId?: string;        // required
   enabled?: boolean;     // default: true
   guardEnabled?: boolean;
+  guardFailMode?: "fail_open" | "fail_closed";
   traceEnabled?: boolean;
 }
 
@@ -25,6 +26,7 @@ function resolveConfig(runtime: IAgentRuntime, opts: PramanaPluginOptions): Pram
     agentId,
     enabled:       opts.enabled       ?? true,
     guardEnabled:  opts.guardEnabled  ?? true,
+    guardFailMode: opts.guardFailMode ?? "fail_open",
     traceEnabled:  opts.traceEnabled  ?? true,
   };
 }

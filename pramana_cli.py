@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import click
+import requests
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -115,6 +117,7 @@ def deploy(rpc: str, verify: bool):
         "forge", "script", "contracts/script/Deploy.s.sol",
         "--rpc-url", rpc,
         "--broadcast",
+        "--via-ir",          # required for ReputationSBT (stack depth)
     ]
     if verify:
         cmd += ["--verify"]
@@ -179,6 +182,120 @@ def status(api_url: str):
             click.echo(f"  {icon} {k}: {v}")
     except Exception as e:
         click.echo(f"API unreachable: {e}", err=True)
+
+
+# ── check ─────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--rpc", default="http://127.0.0.1:8545", help="RPC URL for Anvil/testnet")
+@click.option("--strict", is_flag=True, help="Fail if optional checks are missing (e.g. GROQ key)")
+def check(rpc: str, strict: bool):
+    """Bootstrap readiness check for local production hardening.
+
+    Validates: SQLite, DuckDB, Chroma path, RPC health, contract addresses/code,
+    and Groq key presence.
+    """
+    from core.config.settings import get_settings
+    from core.db import init_sqlite, init_duckdb, get_sqlite_conn, get_duck_conn
+    from web3 import Web3
+
+    s = get_settings()
+    failed = 0
+    warned = 0
+
+    def ok(msg: str) -> None:
+        click.echo(f"  ✓ {msg}")
+
+    def warn(msg: str) -> None:
+        nonlocal warned
+        warned += 1
+        click.echo(f"  ⚠ {msg}")
+
+    def fail(msg: str) -> None:
+        nonlocal failed
+        failed += 1
+        click.echo(f"  ✗ {msg}")
+
+    click.echo("Pramana bootstrap check")
+
+    # DB init + basic queries
+    try:
+        init_sqlite()
+        with get_sqlite_conn() as conn:
+            conn.execute("SELECT 1")
+        ok(f"SQLite ready: {s.SQLITE_PATH}")
+    except Exception as e:
+        fail(f"SQLite check failed: {e}")
+
+    try:
+        init_duckdb()
+        with get_duck_conn() as conn:
+            conn.execute("SELECT 1")
+        ok(f"DuckDB ready: {s.DUCKDB_PATH}")
+    except Exception as e:
+        fail(f"DuckDB check failed: {e}")
+
+    # Chroma path (writable)
+    try:
+        chroma_dir = Path(s.CHROMA_PATH)
+        chroma_dir.mkdir(parents=True, exist_ok=True)
+        probe = chroma_dir / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        ok(f"Chroma path writable: {s.CHROMA_PATH}")
+    except Exception as e:
+        fail(f"Chroma path not writable: {e}")
+
+    # RPC + chain check
+    try:
+        resp = requests.post(
+            rpc,
+            json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
+            timeout=3,
+        )
+        if resp.status_code == 200 and "result" in resp.json():
+            ok(f"RPC reachable: {rpc} (block {resp.json().get('result')})")
+        else:
+            fail(f"RPC unhealthy: HTTP {resp.status_code}")
+    except Exception as e:
+        fail(f"RPC check failed: {e}")
+
+    # Contract config + deployed bytecode checks
+    try:
+        w3 = Web3(Web3.HTTPProvider(rpc))
+        contracts = {
+            "ORCHESTRATOR_ADDR": s.ORCHESTRATOR_ADDR,
+            "GUARDIAN_ADDR": s.GUARDIAN_ADDR,
+            "SBT_ADDR": s.SBT_ADDR,
+        }
+        for name, addr in contracts.items():
+            if not addr:
+                warn(f"{name} not set")
+                continue
+            if not w3.is_address(addr):
+                fail(f"{name} invalid address: {addr}")
+                continue
+            code = w3.eth.get_code(w3.to_checksum_address(addr))
+            if code and code != b"":
+                ok(f"{name} deployed at {addr}")
+            else:
+                fail(f"{name} has no bytecode at {addr}")
+    except Exception as e:
+        fail(f"Contract checks failed: {e}")
+
+    # Groq key check
+    if s.GROQ_API_KEY:
+        ok("GROQ_API_KEY present")
+    else:
+        msg = "GROQ_API_KEY missing"
+        if strict:
+            fail(msg)
+        else:
+            warn(msg)
+
+    click.echo(f"\nSummary: {failed} failed, {warned} warnings")
+    if failed > 0:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

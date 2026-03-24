@@ -62,7 +62,12 @@ class InjectionAgent(BaseL1Agent):
     max_latency_ms = 20.0
 
     def check(self, event: ChainEvent, state: PramanaState) -> L1Result:
-        text = (event.calldata or "") + " " + (event.action or "")
+        # Fix 1: Decode hex calldata before regex matching.
+        # Real-world calldata is 0x-prefixed hex — regex patterns need decoded text.
+        raw_calldata = event.calldata or ""
+        decoded_text = self._decode_calldata_for_scan(raw_calldata)
+        text = decoded_text + " " + (event.action or "")
+
         meta: dict[str, Any] = {}
         matched_labels: list[str] = []
         max_score = 0.0
@@ -74,6 +79,7 @@ class InjectionAgent(BaseL1Agent):
 
         meta["matched_patterns"] = matched_labels
         meta["calldata_len"] = len(text)
+        meta["calldata_decoded"] = decoded_text != raw_calldata
 
         if matched_labels:
             reason = f"injection patterns: {', '.join(matched_labels[:3])}"
@@ -104,13 +110,24 @@ class InjectionAgent(BaseL1Agent):
 
     @staticmethod
     def _check_function_selectors(calldata: str) -> list[str]:
-        """Check calldata for known dangerous 4-byte function selectors."""
-        # selfdestruct(), approve(address,uint256) for unlimited amounts, etc.
+        """Check calldata for known dangerous 4-byte function selectors.
+
+        Fix 2: Use proper 8-hex-char selectors (4 bytes). The old code used
+        'ff' (2 chars) compared against cd[:8] (8 chars), which never matched.
+        Fix 10 (partial): approve_erc20 removed — it's the most common DeFi
+        call and generated massive false positives.
+        """
         DANGEROUS = {
-            "ff": "selfdestruct",
-            "a9059cbb": "transfer_erc20",
-            "095ea7b3": "approve_erc20",
-            "23b872dd": "transferFrom_erc20",
+            # selfdestruct — padded to 4-byte selector format
+            "ff000000": "selfdestruct",
+            # delegatecall proxy patterns
+            "f8dc5dd9": "delegatecall_proxy_upgrade",
+            "3659cfe6": "upgradeTo",
+            "4f1ef286": "upgradeToAndCall",
+            # Ownership transfer (suspicious if unexpected)
+            "f2fde38b": "transferOwnership",
+            # Proxy admin change
+            "8f283970": "changeAdmin",
         }
         cd = calldata.replace("0x", "").lower()
         found = []
@@ -119,3 +136,57 @@ class InjectionAgent(BaseL1Agent):
             if selector in DANGEROUS:
                 found.append(DANGEROUS[selector])
         return found
+
+    @staticmethod
+    def _decode_calldata_for_scan(calldata: str) -> str:
+        """Decode hex calldata to extract scannable text content.
+
+        Fix 1: Real-world calldata is 0x-prefixed ABI-encoded hex. Regex
+        patterns for prompt injection match plaintext, not hex digits.
+        This method hex-decodes the bytes, extracts any UTF-8 strings
+        embedded in the ABI encoding, and returns them for regex scanning.
+        """
+        if not calldata or not calldata.startswith("0x"):
+            return calldata  # Already plaintext or empty
+
+        hex_str = calldata[2:]  # Strip 0x prefix
+        try:
+            raw_bytes = bytes.fromhex(hex_str)
+        except ValueError:
+            return calldata  # Invalid hex, return as-is
+
+        # Strategy 1: Full UTF-8 decode (works if entire payload is text)
+        try:
+            decoded = raw_bytes.decode("utf-8", errors="ignore")
+            # Filter to printable characters (ABI padding produces nulls)
+            printable = "".join(c if c.isprintable() or c in "\n\r\t" else " " for c in decoded)
+            # Collapse whitespace
+            printable = re.sub(r"\s+", " ", printable).strip()
+            if len(printable) > 10:  # Meaningful text found
+                return printable
+        except Exception:
+            pass
+
+        # Strategy 2: Extract ABI string parameters (offset-encoded UTF-8)
+        # ABI strings have: 32-byte offset, 32-byte length, then UTF-8 bytes
+        extracted_strings: list[str] = []
+        i = 0
+        while i + 64 <= len(raw_bytes):
+            # Check if this 32-byte word looks like a string length (reasonable)
+            try:
+                length = int.from_bytes(raw_bytes[i + 32 : i + 64], "big")
+                if 4 < length < 2048 and i + 64 + length <= len(raw_bytes):
+                    candidate = raw_bytes[i + 64 : i + 64 + length]
+                    text = candidate.decode("utf-8", errors="strict")
+                    if text.isprintable() and len(text) > 4:
+                        extracted_strings.append(text)
+                        i += 64 + length
+                        continue
+            except (ValueError, UnicodeDecodeError):
+                pass
+            i += 32
+
+        if extracted_strings:
+            return " ".join(extracted_strings)
+
+        return calldata  # Fallback: return original

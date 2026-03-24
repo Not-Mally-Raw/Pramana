@@ -1,77 +1,81 @@
-"""
-dashboard/app.py — Main Streamlit dashboard entry point.
-Sidebar navigation + org selector + health ticker.
-"""
+"""Pramana Monitor main Streamlit app shell."""
+
+from __future__ import annotations
+
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 import streamlit as st
 
-st.set_page_config(
-    page_title="Pramana AgentOps",
-    page_icon="⛓️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+from core.config.settings import get_settings
+from dashboard.components.monitor_settings import open_monitor_settings_dialog
+from dashboard.components.theme import apply_theme, footer, schedule_rerun
+from dashboard.views import agents, evaluations, forge, overview
 
-with st.sidebar:
-    st.title("⛓️ Pramana")
-    st.caption("Governing the Unseen")
-    st.divider()
 
-    org_id = st.text_input("Org ID", value="default", help="Your organization identifier")
-    api_url = st.text_input("API URL", value="http://localhost:8000", help="Pramana API endpoint")
+def _sidebar(settings) -> tuple[str, str, object, object]:
+    with st.sidebar:
+        st.title("Pramana Monitor")
+        st.caption("Production AgentOps for on-chain and off-chain flows")
+        st.divider()
 
-    st.divider()
-    page = st.radio(
-        "Navigation",
-        ["Overview", "Policies", "Replay", "Identity"],
-        label_visibility="collapsed",
-    )
+        org_id = st.text_input("Org ID", value=settings.DEFAULT_ORG_ID)
 
-    st.divider()
-    # Health ticker
-    health_col1, health_col2 = st.columns(2)
-    try:
-        import requests
-        resp = requests.get(f"{api_url}/health", timeout=2)
-        if resp.status_code == 200:
-            health_col1.success("API ✓")
-        else:
-            health_col1.error("API ✗")
-    except Exception:
-        health_col1.error("API ✗")
+        st.markdown("#### Date Range")
+        date_choice = st.selectbox("Window", ["Last Day", "Last 7D", "Last 1M", "Custom"], index=1)
+        custom_start = None
+        custom_end = None
+        if date_choice == "Custom":
+            c1, c2 = st.columns(2)
+            custom_start = c1.date_input("Start")
+            custom_end = c2.date_input("End")
 
-    try:
-        import requests
-        resp = requests.post(
-            "http://127.0.0.1:8545",
-            json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
-            timeout=1,
+        st.markdown("#### Navigation")
+        page = st.radio(
+            "Pages",
+            ["Dashboard", "Agents", "Monitor Settings", "Evaluations", "Forge"],
+            label_visibility="collapsed",
         )
-        health_col2.success("Chain ✓")
-    except Exception:
-        health_col2.warning("Chain ✗")
 
-# Store in session for pages
-st.session_state["org_id"]  = org_id
-st.session_state["api_url"] = api_url
+        st.markdown("#### Ask AI")
+        st.caption("Use page-level Ask AI panels for contextual answers.")
 
-# ── Page routing ──────────────────────────────────────────────────────────────
+        return org_id, page, date_choice, (custom_start, custom_end)
 
-if page == "Overview":
-    from dashboard.pages import overview
-    overview.render(api_url, org_id)
-elif page == "Policies":
-    from dashboard.pages import policies
-    policies.render(api_url, org_id)
-elif page == "Replay":
-    from dashboard.pages import replay
-    replay.render(api_url, org_id)
-elif page == "Identity":
-    from dashboard.pages import identity
-    identity.render(api_url, org_id)
+
+def main() -> None:
+    settings = get_settings()
+    apply_theme()
+    schedule_rerun(seconds=15)
+
+    org_id, page, date_choice, custom_dates = _sidebar(settings)
+    custom_start, custom_end = custom_dates
+
+    top_l, top_r = st.columns([8, 1])
+    with top_l:
+        st.markdown("## Pramana Monitor")
+    with top_r:
+        if st.button("Settings", use_container_width=True):
+            open_monitor_settings_dialog()
+
+    if page == "Dashboard":
+        overview.render(org_id, date_choice, custom_start, custom_end)
+    elif page == "Agents":
+        agents.render(org_id)
+    elif page == "Monitor Settings":
+        st.subheader("Monitor Settings")
+        st.write("Use the button below to open the full settings panel.")
+        if st.button("Open Monitor Settings Panel", type="primary"):
+            open_monitor_settings_dialog()
+    elif page == "Evaluations":
+        evaluations.render(org_id)
+    else:
+        forge.render()
+
+    footer(settings.APP_VERSION)
+
+
+if __name__ == "__main__":
+    main()
