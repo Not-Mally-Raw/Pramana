@@ -91,6 +91,57 @@ app.add_middleware(
 )
 
 
+# ── JWT Auth & Rate Limiting ──────────────────────────────────────────────────
+
+import time
+import jwt
+from fastapi.responses import JSONResponse
+
+# Simple in-memory Token Bucket / Sliding Window: {org_id: (count, reset_epoch)}
+_RATE_LIMITS: dict[str, tuple[int, float]] = {}
+
+@app.middleware("http")
+async def auth_and_rate_limit(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/health") or path.startswith("/docs") or path.startswith("/openapi.json"):
+        return await call_next(request)
+
+    cfg = get_settings()
+    auth_header = request.headers.get("Authorization")
+    
+    # 1. JWT Authentication
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return JSONResponse(status_code=401, content={"status": "error", "detail": "Missing JWT Bearer token"})
+        
+    token = auth_header.split(" ")[1]
+    
+    try:
+        payload = jwt.decode(token, cfg.JWT_SECRET, algorithms=["HS256"])
+        org_id = payload.get("org_id")
+        if not org_id:
+            raise Exception("Missing org_id claim in token")
+    except Exception as e:
+        return JSONResponse(status_code=401, content={"status": "error", "detail": f"Invalid token: {e}"})
+
+    # 2. Rate Limiting: 10 req/s per organization
+    now = time.time()
+    count, reset_time = _RATE_LIMITS.get(org_id, (0, 0.0))
+    if now > reset_time:
+        # Reset 1-second window
+        _RATE_LIMITS[org_id] = (1, now + 1.0)
+    else:
+        if count >= 10:
+            return JSONResponse(status_code=429, content={"status": "error", "detail": "Rate limit exceeded (10 req/s per org). Slow down."})
+        _RATE_LIMITS[org_id] = (count + 1, reset_time)
+
+    # 3. Inject verified org_id into ASGI scope headers (so x_org_id=Header() dependencies work unmodified)
+    headers = dict(request.scope.get("headers", []))
+    headers[b"x-org-id"] = org_id.encode()
+    request.scope["headers"] = [(k, v) for k, v in headers.items()]
+
+    return await call_next(request)
+
+
 # ── Helper ────────────────────────────────────────────────────────────────────
 
 def _org_id(x_org_id: str | None) -> str:

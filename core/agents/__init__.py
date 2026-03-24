@@ -12,6 +12,7 @@ from core.agents.operations import OperationsAgent
 from core.agents.recovery import RecoveryAgent
 from core.agents.reputation import ReputationAgent
 from core.agents.validator import ValidatorAgent
+from core.agents.sanctions import SanctionsAgent
 
 __all__ = [
     "BaseL1Agent",
@@ -25,4 +26,5 @@ __all__ = [
     "CouncilAgent",
     "RecoveryAgent",
     "ReputationAgent",
+    "SanctionsAgent",
 ]

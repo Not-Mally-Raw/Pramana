@@ -43,40 +43,45 @@ class ValidatorAgent(BaseL1Agent):
     max_latency_ms = 50.0
 
     def check(self, event: ChainEvent, state: PramanaState) -> L1Result:
+        """First pass: ABI-aware calldata parsing and deep address validation."""
         meta: dict[str, Any] = {}
         issues: list[str] = []
         score = 0.0
 
-        # ── JSON schema validation ─────────────────────────────────────────
-        calldata_obj = self._parse_calldata(event.calldata or "")
-        meta["calldata_parsed"] = bool(calldata_obj)
+        from core.parsers.calldata import decode_all_calls
+        
+        # ── ABI Calldata Parsing ──────────────────────────────────────────
+        calls = decode_all_calls(event.calldata or "")
+        meta["decoded_calls_count"] = len(calls)
+        
+        if calls:
+            meta["primary_protocol"] = calls[0].protocol
+            meta["primary_action"] = calls[0].name
+            
+            # Check for explicitly risky selectors
+            for c in calls:
+                if c.risk == "critical":
+                    issues.append(f"critical action: {c.name} ({c.protocol})")
+                    score = max(score, 0.95)
+                elif c.risk == "high":
+                    issues.append(f"high risk action: {c.name} ({c.protocol})")
+                    score = max(score, 0.80)
+        else:
+            # Fallback for unrecognized/opaque calldata
+            if event.calldata and len(event.calldata) > 10:
+                issues.append("opaque/unrecognized calldata payload")
+                score = max(score, 0.40)
 
-        action_lower = (event.action or "").lower()
-
-        if calldata_obj and action_lower in _SCHEMAS:
-            schema = _SCHEMAS[action_lower]
-            missing = [k for k in schema.get("required", []) if k not in calldata_obj]
-            if missing:
-                issues.append(f"schema violation: missing required fields {missing}")
-                score = max(score, 0.70)
-                meta["schema_missing_fields"] = missing
-
-            # Property pattern validation
-            for field, rule in schema.get("properties", {}).items():
-                if field in calldata_obj and "pattern" in rule:
-                    if not isinstance(calldata_obj[field], str) or not __import__("re").match(
-                        rule["pattern"], calldata_obj[field]
-                    ):
-                        issues.append(f"field '{field}' format invalid")
-                        score = max(score, 0.65)
-
-        # ── Address validation ────────────────────────────────────────────
-        if calldata_obj:
-            for field in ("to", "from", "spender", "recipient"):
-                addr = calldata_obj.get(field, "")
-                if addr and not self._is_valid_address(addr):
-                    issues.append(f"invalid address in '{field}': {str(addr)[:20]}")
-                    score = max(score, 0.75)
+        # ── Deep Address Validation ───────────────────────────────────────
+        all_addresses = set()
+        for c in calls:
+            all_addresses.update(c.addresses)
+            
+        invalid_addrs = [a for a in all_addresses if not self._is_valid_address(a)]
+        if invalid_addrs:
+            issues.append(f"invalid addresses found in calldata: {len(invalid_addrs)}")
+            score = max(score, 0.85)
+            meta["invalid_addresses"] = invalid_addrs
 
         # ── Value sanity check ────────────────────────────────────────────
         value_eth = event.value_wei / 1e18 if event.value_wei else 0.0

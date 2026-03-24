@@ -66,7 +66,16 @@ class InjectionAgent(BaseL1Agent):
         # Real-world calldata is 0x-prefixed hex — regex patterns need decoded text.
         raw_calldata = event.calldata or ""
         decoded_text = self._decode_calldata_for_scan(raw_calldata)
-        text = decoded_text + " " + (event.action or "")
+        
+        # Phase 1: Native ABI Calldata Parsing
+        # Extract explicit string parameters even if deeply nested in AA batch calls
+        from core.parsers.calldata import decode_all_calls
+        parsed_strings = []
+        calls = decode_all_calls(raw_calldata)
+        for c in calls:
+            parsed_strings.extend(c.strings)
+            
+        text = decoded_text + " " + " ".join(parsed_strings) + " " + (event.action or "")
 
         meta: dict[str, Any] = {}
         matched_labels: list[str] = []

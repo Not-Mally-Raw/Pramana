@@ -255,20 +255,46 @@ class EconomicSanityAgent(BaseL1Agent):
 
     @staticmethod
     def _check_token_risk(calldata: str) -> int:
+        from core.parsers.calldata import decode_all_calls
+        calls = decode_all_calls(calldata)
+        if not calls:
+            # Fallback to simple substring
+            calldata_lower = calldata.lower()
+        else:
+            # Extract all strings across all batch calls deeply
+            strings = []
+            for c in calls:
+                strings.extend(c.strings)
+                strings.append(c.name.lower())
+                strings.append(c.protocol.lower())
+            calldata_lower = " ".join(strings).lower()
+            
         risky_keywords = ["honeypot", "rug", "flash", "rebasing"]
-        flags = 0
-        for kw in risky_keywords:
-            if kw in calldata.lower():
-                flags += 1
+        flags = sum(1 for kw in risky_keywords if kw in calldata_lower)
         return flags
 
     @staticmethod
     def _check_allowance_security(calldata: str) -> bool:
+        from core.parsers.calldata import decode_all_calls
+        calls = decode_all_calls(calldata)
+        
+        # New ABI parsing path
+        if calls:
+            for call in calls:
+                if call.name == "approve":
+                    amount = call.params.get("amount", 0)
+                    # UINT256_MAX check — blocks infinite approvals
+                    if isinstance(amount, int) and amount > 115792089237316195423570985008687907853269984665640564000000000000000000000000:
+                        return False
+            return True
+
+        # Legacy JSON string path (for test compatibility)
         if "approve" in calldata.lower():
             try:
+                import json
                 obj = json.loads(calldata) if calldata.startswith("{") else {}
-                amount = obj.get("amount", "")
-                if amount == "UINT256_MAX" or amount == "2**256-1":
+                amount_str = str(obj.get("amount", ""))
+                if amount_str == "UINT256_MAX" or amount_str == "2**256-1":
                     return False
             except Exception:
                 pass

@@ -15,19 +15,21 @@ from core.agents import (
     NetworkAgent,
     OperationsAgent,
     ValidatorAgent,
+    SanctionsAgent,
 )
 
 __all__ = ["MonitoringCrew"]
 
 # Execution order (NetworkX critical path order)
 _AGENT_ORDER = [
-    NetworkAgent(),
-    OperationsAgent(),
-    HallucinationAgent(),
-    InjectionAgent(),
-    ValidatorAgent(),
-    EconomicSanityAgent(),
-    DriftMonitorAgent(),
+    SanctionsAgent(),      # 1. Hard-stop compliance
+    NetworkAgent(),        # 2. Infra context
+    OperationsAgent(),     # 3. Account balance context
+    HallucinationAgent(),  # 4. LLM output anomalies
+    InjectionAgent(),      # 5. Security payloads (hard-stop)
+    ValidatorAgent(),      # 6. Schema/ABI validity
+    EconomicSanityAgent(), # 7. MEV/Profitability
+    DriftMonitorAgent(),   # 8. Behavioral drift
 ]
 
 
@@ -54,6 +56,16 @@ class MonitoringCrew:
 
             result = agent.run(event, state)
             results.append(result)
+
+            # Hard stop: sanctions hit → skip remaining L1 agents immediately
+            if agent.name == "sanctions" and result.flagged:
+                remaining = [a for a in _AGENT_ORDER if a not in _AGENT_ORDER[:_AGENT_ORDER.index(agent) + 1]]
+                for rem in remaining:
+                    results.append(
+                        L1Result(agent_name=rem.name, flagged=False, score=0.0,
+                                 reason="skipped: OFAC sanctions hard-stop", latency_ms=0.0, pass_count=0, metadata={})
+                    )
+                break
 
             # Hard stop: injection flagged at high confidence → skip remaining L1 agents
             if agent.name == "injection" and result.flagged and result.score >= 0.90:

@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     DEBUG:       bool = False
     LOG_LEVEL:   str = "INFO"
+    JWT_SECRET:  str = "default_secret_key_change_in_production_2026"
 
     # ── Network ──────────────────────────────────────────────────────────────
     NETWORK:           str = "anvil"         # anvil | sepolia | base

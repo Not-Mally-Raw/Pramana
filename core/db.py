@@ -109,6 +109,19 @@ CREATE TABLE IF NOT EXISTS reputation_scores (
     PRIMARY KEY (agent_addr, org_id)
 );
 
+CREATE TABLE IF NOT EXISTS sanctions_list (
+    address      TEXT PRIMARY KEY,
+    source       TEXT,
+    updated_at   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bundler_registry (
+    bundler_url  TEXT PRIMARY KEY,
+    org_id       TEXT NOT NULL,
+    active       INTEGER DEFAULT 1,
+    registered_at TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_org    ON events(org_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_agent  ON events(agent_addr, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_org    ON traces(org_id, created_at DESC);
@@ -119,6 +132,20 @@ CREATE INDEX IF NOT EXISTS idx_policies_org  ON policies(org_id, agent_addr);
 
 def _ensure_dir(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+def is_sanctioned(address: str) -> bool:
+    """O(1) local sanctions check."""
+    if not address:
+        return False
+    try:
+        with get_sqlite_conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM sanctions_list WHERE lower(address) = ?",
+                (address.lower(),)
+            ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
 
 
 def init_sqlite() -> None:
