@@ -116,10 +116,48 @@ CREATE TABLE IF NOT EXISTS sanctions_list (
 );
 
 CREATE TABLE IF NOT EXISTS bundler_registry (
-    bundler_url  TEXT PRIMARY KEY,
-    org_id       TEXT NOT NULL,
-    active       INTEGER DEFAULT 1,
-    registered_at TEXT
+    bundler_url     TEXT PRIMARY KEY,
+    org_id          TEXT NOT NULL,
+    active          INTEGER DEFAULT 1,
+    fallback_policy TEXT DEFAULT 'ESCALATE',
+    registered_at   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS user_operations (
+    user_op_hash             TEXT PRIMARY KEY,
+    sender                   TEXT NOT NULL,
+    entry_point              TEXT,
+    paymaster                TEXT,
+    nonce_key                INTEGER,
+    nonce_sequence           INTEGER,
+    call_gas_limit           INTEGER,
+    verification_gas_limit   INTEGER,
+    pre_verification_gas     INTEGER,
+    decision                 TEXT,
+    risk_score               REAL,
+    trace_hash               TEXT,
+    bundler_id               TEXT,
+    chain_id                 INTEGER,
+    attestation_nonce        TEXT,
+    attestation_expires      INTEGER,
+    created_at               TEXT
+);
+
+CREATE TABLE IF NOT EXISTS attestation_log (
+    user_op_hash       TEXT PRIMARY KEY,
+    attestation_nonce  TEXT NOT NULL,
+    redeemed           INTEGER DEFAULT 0,
+    expires_at         INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS lifecycle_transitions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_addr    TEXT NOT NULL,
+    org_id        TEXT NOT NULL,
+    from_state    TEXT NOT NULL,
+    to_state      TEXT NOT NULL,
+    reason        TEXT,
+    created_at    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_org    ON events(org_id, created_at DESC);
@@ -127,6 +165,7 @@ CREATE INDEX IF NOT EXISTS idx_events_agent  ON events(agent_addr, created_at DE
 CREATE INDEX IF NOT EXISTS idx_traces_org    ON traces(org_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_hash   ON traces(trace_hash);
 CREATE INDEX IF NOT EXISTS idx_policies_org  ON policies(org_id, agent_addr);
+CREATE INDEX IF NOT EXISTS idx_userops_sender_nonce ON user_operations(sender, nonce_key);
 """
 
 

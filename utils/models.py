@@ -43,19 +43,61 @@ class AgentProfile(str, Enum):
     GENERIC    = "generic"
 
 
+# ─── ERC-4337 Account Abstraction ─────────────────────────────────────────────
+
+from pydantic import model_validator
+
+class UserOperation(BaseModel):
+    """ERC-4337 UserOperation schema supporting both v0.6 and v0.7 structs."""
+    sender: str
+    nonce: int
+    callData: str
+    callGasLimit: int
+    verificationGasLimit: int
+    preVerificationGas: int
+    maxFeePerGas: int
+    maxPriorityFeePerGas: int
+    signature: str
+
+    # v0.6 specific
+    initCode: Optional[str] = None
+    paymasterAndData: Optional[str] = None
+    
+    # v0.7 specific
+    factory: Optional[str] = None
+    factoryData: Optional[str] = None
+    paymaster: Optional[str] = None
+    paymasterVerificationGasLimit: Optional[int] = None
+    paymasterPostOpGasLimit: Optional[int] = None
+    paymasterData: Optional[str] = None
+
+    # Computed fields (extracted from 256-bit nonce)
+    nonce_key: int = 0
+    nonce_sequence: int = 0
+
+    @model_validator(mode='after')
+    def split_nonce(self) -> 'UserOperation':
+        # Nonce is 256-bit: upper 192 bits are nonce_key (lane), lower 64 bits are sequence
+        self.nonce_key = self.nonce >> 64
+        self.nonce_sequence = self.nonce & ((1 << 64) - 1)
+        return self
+
+
 # ─── Core Event ───────────────────────────────────────────────────────────────
 
 class ChainEvent(BaseModel):
-    """Raw event from WebSocket / Anvil listener."""
+    """Raw event from WebSocket / Anvil listener or UserOperation adapter."""
     agent_id:   str           # Ethereum address or identifier
     org_id:     str
     tx_hash:    str
-    action:     str           # e.g. "swap", "transfer", "call"
+    action:     str           # e.g. "swap", "transfer", "call", "user_operation"
     calldata:   str           # hex-encoded
     value_wei:  int = 0
     gas_price:  int = 0
     timestamp:  float = Field(default_factory=time.time)
     network:    str = "anvil" # anvil | sepolia | base
+    user_operation: Optional[UserOperation] = None
+    metadata:   dict[str, Any] = Field(default_factory=dict)
 
 
 # ─── L1 Agent Results ─────────────────────────────────────────────────────────

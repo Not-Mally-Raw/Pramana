@@ -300,6 +300,106 @@ async def update_routing_rule(req: RoutingRuleRequest):
     return ApiResponse(status="updated", data={"rule_key": req.rule_key})
 
 
+# ── Bundler AA Validation ──────────────────────────────────────────────────────
+
+@app.post("/bundler/validate", response_model=ApiResponse)
+async def validate_user_op(request: Request, bg_tasks: __import__('fastapi').BackgroundTasks):
+    """
+    High-throughput ERC-4337 intercept layer for Bundlers.
+    Returns 200 OK with HMAC-signed PASS/PAUSE/ESCALATE decision so bundlers can securely include/reject the op.
+    """
+    from core.parsers.userop import UserOperationParser, MalformedUserOpError
+    from core.attestation import AttestationService, AttestationReplayError
+    from core.flow import PramanaFlow
+    from utils.models import DegradedMode, PramanaState
+    import asyncio
+
+    # Get injected verified org_id from the JWT middleware
+    org_id = request.state.org_id if hasattr(request.state, "org_id") else _org_id(request.headers.get("x-org-id"))
+    bundler_id = request.headers.get("x-bundler-id", "unknown_bundler")
+
+    try:
+        body = await request.json()
+        payload = body.get("userOperation") or body
+        # 1. Parse and Adapt
+        user_op = UserOperationParser.parse(payload)
+        chain_event = UserOperationParser.adapt_to_chain_event(user_op, bundler_id=bundler_id, org_id=org_id)
+        
+        # 2. Replay Protection - check early
+        AttestationService.check_and_redeem_replay(chain_event.tx_hash)
+
+        # 3. Lookup Fallback Policy
+        fallback_policy = "ESCALATE"
+        with get_sqlite_conn() as conn:
+            row = conn.execute("SELECT fallback_policy FROM bundler_registry WHERE bundler_url=? OR bundler_url=?", (bundler_id, org_id)).fetchone()
+            if row:
+                fallback_policy = row["fallback_policy"]
+
+        # 4. Execute MonitoringCrew (L1 only) via Flow bypass or standard kicks
+        # The user requested <500ms p95. Running all L1s synchronously in an executor.
+        state = PramanaState(event=chain_event, degraded_mode=DegradedMode.NORMAL)
+        flow = PramanaFlow()
+        
+        try:
+            # We want to wait tightly for flow completion. 
+            # In Phase 2, wait_for handles the 800ms SLA fallback
+            result_state = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda: flow.kickoff(inputs={"event": chain_event.model_dump()})
+                ),
+                timeout=0.8
+            )
+            final = result_state if isinstance(result_state, PramanaState) else (flow.state if hasattr(flow, "state") else state)
+            
+            # The action is final.action.
+            action = str(final.action).upper()
+            score = final.risk_score
+            
+        except asyncio.TimeoutError:
+            action = fallback_policy
+            score = 0.5
+            logger.warning(f"Bundler validation timeout for OPHash {chain_event.tx_hash}. Returning fallback {action}.")
+            
+        # 5. Save to user_operations DB
+        def _save_db():
+            try:
+                with get_sqlite_conn() as conn:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO user_operations (user_op_hash, sender, entry_point, paymaster, nonce_key, nonce_sequence, call_gas_limit, verification_gas_limit, pre_verification_gas, decision, risk_score, trace_hash, bundler_id, chain_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+                        (
+                            chain_event.tx_hash, user_op.sender, None, 
+                            user_op.paymaster or user_op.paymasterAndData, 
+                            user_op.nonce_key, user_op.nonce_sequence, 
+                            user_op.callGasLimit, user_op.verificationGasLimit, user_op.preVerificationGas, 
+                            action, score, chain_event.tx_hash, bundler_id, 31337
+                        )
+                    )
+            except Exception as e:
+                logger.error(f"Failed to log userOp: {e}")
+                
+        bg_tasks.add_task(_save_db)
+
+        # 6. Sign and Return
+        attestation = AttestationService.sign(
+            user_op_hash=chain_event.tx_hash,
+            decision=action,
+            risk_score=score,
+            trace_hash=chain_event.tx_hash,
+            bundler_id=bundler_id
+        )
+
+        return ApiResponse(status="ok", data={"attestation": attestation})
+
+    except MalformedUserOpError as e:
+        return ApiResponse(status="error", data={"reason": str(e), "decision": "PAUSE"})
+    except AttestationReplayError as e:
+        return ApiResponse(status="error", data={"reason": str(e), "decision": "PAUSE"})
+    except Exception as e:
+        # 5xx Fallback
+        logger.error(f"Validation crash: {e}")
+        return ApiResponse(status="error", data={"reason": "Internal Server Error", "decision": "ESCALATE"})
+
+
 # ── Guard (pre-action hook for SDK) ──────────────────────────────────────────
 
 class GuardRequest(BaseModel):
