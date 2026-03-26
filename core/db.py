@@ -116,11 +116,12 @@ CREATE TABLE IF NOT EXISTS sanctions_list (
 );
 
 CREATE TABLE IF NOT EXISTS bundler_registry (
-    bundler_url     TEXT PRIMARY KEY,
-    org_id          TEXT NOT NULL,
-    active          INTEGER DEFAULT 1,
-    fallback_policy TEXT DEFAULT 'ESCALATE',
-    registered_at   TEXT
+    bundler_url       TEXT PRIMARY KEY,
+    org_id            TEXT NOT NULL,
+    active            INTEGER DEFAULT 1,
+    fallback_policy   TEXT DEFAULT 'ESCALATE',
+    supported_chains  TEXT,
+    registered_at     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS user_operations (
@@ -151,13 +152,21 @@ CREATE TABLE IF NOT EXISTS attestation_log (
 );
 
 CREATE TABLE IF NOT EXISTS lifecycle_transitions (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_addr    TEXT NOT NULL,
-    org_id        TEXT NOT NULL,
-    from_state    TEXT NOT NULL,
-    to_state      TEXT NOT NULL,
-    reason        TEXT,
-    created_at    TEXT
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_addr            TEXT NOT NULL,
+    org_id                TEXT NOT NULL,
+    from_state            TEXT NOT NULL,
+    to_state              TEXT NOT NULL,
+    reason                TEXT,
+    capital_at_risk_usd   REAL,
+    created_at            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS known_contracts (
+    address            TEXT PRIMARY KEY,
+    chain_id           INTEGER NOT NULL,
+    deployed_block     INTEGER NOT NULL,
+    verified_at        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_org    ON events(org_id, created_at DESC);

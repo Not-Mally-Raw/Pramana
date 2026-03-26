@@ -12,8 +12,12 @@ from core.db import get_sqlite_conn
 from core.parsers.calldata import CalldataParser
 from core.config.settings import get_settings
 from utils.models import ChainEvent, L1Result, PramanaState
+import time
 
 logger = logging.getLogger("pramana.aa_validator")
+
+# In-memory TTL cache for paymaster node queries to maintain <500ms p95
+_paymaster_deposit_cache = {} # Dict[str, Tuple[uint112, float(auth_time)]]
 
 # The canonical ERC-4337 v0.6 and v0.7 EntryPoint addresses
 CANONICAL_ENTRY_POINTS = {
@@ -47,11 +51,17 @@ class AAValidatorAgent(BaseL1Agent):
             max_score = max(max_score, 0.90)  # High risk
 
         # 2. check_call_graph_depth(): Detect excessive nesting / recursion
-        depth = self._check_call_graph_depth(uop.callData)
+        depth, targets = self._check_call_graph_depth(uop.callData)
         meta["call_depth"] = depth
         if depth > 8:
             flags.append(f"excessive call depth ({depth})")
             max_score = max(max_score, 0.75)
+            
+        # 2.b check_contract_age() for new targeted addresses
+        unverified_targets = self._check_targeted_contract_age(targets)
+        if unverified_targets:
+            flags.append(f"interacting with unknown/recent contracts: {','.join(unverified_targets[:3])}")
+            max_score = max(max_score, 0.65)
 
         # 3. check_nonce_lane_parallelism()
         profile = state.agent_profile or "generic"
@@ -65,7 +75,7 @@ class AAValidatorAgent(BaseL1Agent):
         # 4. check_gas_budget_inflation()
         total_gas = uop.callGasLimit + uop.verificationGasLimit + uop.preVerificationGas
         meta["total_gas_declared"] = total_gas
-        gas_ratio = self._check_gas_budget_inflation(uop.sender, total_gas)
+        gas_ratio = self._check_gas_budget_inflation(uop.sender, total_gas, profile)
         meta["gas_inflation_ratio"] = gas_ratio
         if gas_ratio > 3.0:
             flags.append(f"gas budget inflation ({gas_ratio:.1f}x historical median)")
@@ -118,14 +128,23 @@ class AAValidatorAgent(BaseL1Agent):
                     # Self-paying account
                     target = uop.sender
 
-                if target:
+                # Check TTL Cache first
+                cache_hit = _paymaster_deposit_cache.get(target)
+                now = time.time()
+                deposit = 0
+                
+                if cache_hit and now - cache_hit[1] < 60:
+                    deposit = cache_hit[0]
+                else:
                     info = ep_contract.functions.getDepositInfo(Web3.to_checksum_address(target)).call()
                     deposit = info[0] # deposit is uint112
-                    meta["sponsor_deposit_wei"] = deposit
+                    _paymaster_deposit_cache[target] = (deposit, now)
                     
-                    if deposit < total_required_wei:
-                        flags.append(f"undercollateralized {'paymaster' if has_paymaster else 'sender'} (deposit {deposit} < required {total_required_wei})")
-                        max_score = max(max_score, 0.85)
+                meta["sponsor_deposit_wei"] = deposit
+                
+                if deposit < total_required_wei:
+                    flags.append(f"undercollateralized {'paymaster' if has_paymaster else 'sender'} (deposit {deposit} < required {total_required_wei})")
+                    max_score = max(max_score, 0.85)
 
         except Exception as e:
             logger.warning("AAValidator verify() node check failed: %s", e)
@@ -139,13 +158,15 @@ class AAValidatorAgent(BaseL1Agent):
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
-    def _check_call_graph_depth(self, calldata: str) -> int:
-        """Determines execution depth by asking CalldataParser to unwrap batches."""
+    def _check_call_graph_depth(self, calldata: str) -> tuple[int, list[str]]:
+        """Determines execution depth and extracts target addresses by asking CalldataParser."""
         if not calldata or calldata == "0x":
-            return 0
+            return 0, []
         try:
             parser = CalldataParser()
             calls = parser.decode_batch_calls(calldata)
+            targets = []
+            
             # Find the deepest nested level
             def get_depth(batch_calls):
                 if not batch_calls:
@@ -153,6 +174,13 @@ class AAValidatorAgent(BaseL1Agent):
                 max_d = 0
                 for c in batch_calls:
                     d = 1
+                    func = getattr(c, "function", "")
+                    # Extract targets
+                    if "target" in getattr(c, "parameters", {}):
+                        targets.append(c.parameters["target"])
+                    if "to" in getattr(c, "parameters", {}):
+                        targets.append(c.parameters["to"])
+                        
                     if "calls" in getattr(c, "parameters", {}):
                         # Recursive unwrapping not strictly returned by parser as tree,
                         # but we can count total calls as a proxy for complexity depth
@@ -160,9 +188,26 @@ class AAValidatorAgent(BaseL1Agent):
                     max_d = max(max_d, d)
                 return max_d
 
-            return max(1, len(calls))
+            return max(1, len(calls)), targets
         except Exception:
-            return 1
+            return 1, []
+
+    def _check_targeted_contract_age(self, targets: list[str]) -> list[str]:
+        """Flags targeted addresses if they aren't in the known_contracts 30-day safe list."""
+        unverified = []
+        if not targets:
+            return unverified
+        try:
+            with get_sqlite_conn() as conn:
+                for target in targets:
+                    if not target or not isinstance(target, str):
+                        continue
+                    row = conn.execute("SELECT 1 FROM known_contracts WHERE lower(address)=?", (target.lower(),)).fetchone()
+                    if not row:
+                        unverified.append(target)
+            return unverified
+        except Exception:
+            return []
 
 
     def _get_lane_limit(self, profile: str) -> int:
@@ -191,7 +236,7 @@ class AAValidatorAgent(BaseL1Agent):
             return 0
 
 
-    def _check_gas_budget_inflation(self, sender: str, current_total_gas: int) -> float:
+    def _check_gas_budget_inflation(self, sender: str, current_total_gas: int, profile: str) -> float:
         """Returns the ratio of current gas vs the agent's historical median."""
         try:
             with get_sqlite_conn() as conn:
@@ -208,7 +253,12 @@ class AAValidatorAgent(BaseL1Agent):
                 
                 if avg_gas and avg_gas > 0:
                     return current_total_gas / avg_gas
-                return 1.0 # no history
+                    
+            # Fallback to defaults
+            s = get_settings()
+            thresholds = s.AGENT_PROFILE_THRESHOLDS.get(profile, s.AGENT_PROFILE_THRESHOLDS["generic"])
+            default_gas = thresholds.get("DEFAULT_GAS_BUDGET", 200000)
+            return current_total_gas / max(default_gas, 1)
         except Exception:
             return 1.0
 

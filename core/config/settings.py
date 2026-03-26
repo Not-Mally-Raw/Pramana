@@ -74,43 +74,49 @@ class Settings(BaseSettings):
             "ACTION_LOOP_PER_MIN": 5,
             "BALANCE_DRAIN_PCT": 0.05,
             "RISK_SCORE_PAUSE": 0.60,
-            "GAS_SPIKE_MULTIPLIER": 1.5,   # Fix 11: new
-            "DRIFT_WINDOW_TXS": 10,        # Fix 11: new
+            "GAS_SPIKE_MULTIPLIER": 1.5,
+            "DRIFT_WINDOW_TXS": 10,
+            "DEFAULT_GAS_BUDGET": 500000,
         },
         "keeper_bot": {
             "ACTION_LOOP_PER_MIN": 10,
             "BALANCE_DRAIN_PCT": 0.10,
             "RISK_SCORE_PAUSE": 0.70,
-            "GAS_SPIKE_MULTIPLIER": 2.0,   # Fix 11: new
-            "DRIFT_WINDOW_TXS": 20,        # Fix 11: new
+            "GAS_SPIKE_MULTIPLIER": 2.0,
+            "DRIFT_WINDOW_TXS": 20,
+            "DEFAULT_GAS_BUDGET": 1000000,
         },
         "arb_bot": {
-            "ACTION_LOOP_PER_MIN": 60,     # Fix 11: was 30, too low for real arb
+            "ACTION_LOOP_PER_MIN": 60,
             "BALANCE_DRAIN_PCT": 0.20,
             "RISK_SCORE_PAUSE": 0.80,
-            "GAS_SPIKE_MULTIPLIER": 4.0,   # Fix 11: new — arb bots bid aggressively
-            "DRIFT_WINDOW_TXS": 100,       # Fix 11: new — 30+ actions/min needs wide window
+            "GAS_SPIKE_MULTIPLIER": 4.0,
+            "DRIFT_WINDOW_TXS": 100,
+            "DEFAULT_GAS_BUDGET": 750000,
         },
         "rebalancer": {
             "ACTION_LOOP_PER_MIN": 15,
             "BALANCE_DRAIN_PCT": 0.15,
             "RISK_SCORE_PAUSE": 0.75,
-            "GAS_SPIKE_MULTIPLIER": 2.5,   # Fix 11: new
-            "DRIFT_WINDOW_TXS": 30,        # Fix 11: new
+            "GAS_SPIKE_MULTIPLIER": 2.5,
+            "DRIFT_WINDOW_TXS": 30,
+            "DEFAULT_GAS_BUDGET": 300000,
         },
-        "market_maker": {                  # Fix 11: new profile
+        "market_maker": {
             "ACTION_LOOP_PER_MIN": 200,
             "BALANCE_DRAIN_PCT": 0.60,
             "RISK_SCORE_PAUSE": 0.85,
             "GAS_SPIKE_MULTIPLIER": 3.0,
             "DRIFT_WINDOW_TXS": 200,
+            "DEFAULT_GAS_BUDGET": 500000,
         },
         "generic": {
             "ACTION_LOOP_PER_MIN": 5,
             "BALANCE_DRAIN_PCT": 0.10,
             "RISK_SCORE_PAUSE": 0.70,
-            "GAS_SPIKE_MULTIPLIER": 2.0,   # Fix 11: new
-            "DRIFT_WINDOW_TXS": 10,        # Fix 11: new
+            "GAS_SPIKE_MULTIPLIER": 2.0,
+            "DRIFT_WINDOW_TXS": 10,
+            "DEFAULT_GAS_BUDGET": 200000,
         },
     }
 

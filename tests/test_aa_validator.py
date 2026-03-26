@@ -54,7 +54,7 @@ def make_user_op(overrides: dict = None) -> dict:
     return base
 
 
-@patch("core.agents.aa_validator.AAValidatorAgent._check_call_graph_depth", return_value=1)
+@patch("core.agents.aa_validator.AAValidatorAgent._check_call_graph_depth", return_value=(1, []))
 def test_happy_path(mock_depth):
     # A perfectly normal UserOp using JWT override header for testing (handled by testclient if we stub)
     # Actually, we rely on the injected x-org-id fallback in app.py for test requests without real JWT
@@ -101,7 +101,7 @@ def test_non_canonical_entry_point():
     from core.parsers.userop import UserOperationParser
 
     uop = UserOperationParser.parse(make_user_op())
-    event = UserOperationParser.adapt_to_chain_event(uop)
+    event = UserOperationParser.adapt_to_chain_event(uop, entry_point=INVALID_ENTRY_POINT, chain_id=31337)
     # Hack the metadata for the check
     event.metadata = {"entry_point": INVALID_ENTRY_POINT}
     state = PramanaState(event=event)
@@ -123,7 +123,7 @@ def test_nonce_lane_parallelism():
         from core.parsers.userop import UserOperationParser
 
         uop = UserOperationParser.parse(make_user_op({"nonce": (5 << 64) | 1})) # key=5
-        event = UserOperationParser.adapt_to_chain_event(uop)
+        event = UserOperationParser.adapt_to_chain_event(uop, entry_point=VALID_ENTRY_POINT, chain_id=31337)
         
         # Test Treasury Profile (Limit 1)
         state_treasury = PramanaState(event=event, agent_profile="treasury_bot")
@@ -143,7 +143,7 @@ def test_gas_budget_inflation():
         from core.parsers.userop import UserOperationParser
 
         uop = UserOperationParser.parse(make_user_op())
-        event = UserOperationParser.adapt_to_chain_event(uop)
+        event = UserOperationParser.adapt_to_chain_event(uop, entry_point=VALID_ENTRY_POINT, chain_id=31337)
         state = PramanaState(event=event)
         
         agent = AAValidatorAgent()
@@ -180,3 +180,50 @@ def test_replay_protection():
     assert data["status"] == "error"
     assert "Replay Attempt" in data["data"]["reason"] or "already evaluated" in data["data"]["reason"]
     assert data["data"]["decision"] == "PAUSE"
+
+async def mock_wait_for(coro, timeout):
+    return await coro
+
+@patch("core.app.asyncio.wait_for", side_effect=mock_wait_for)
+@patch("core.agents.aa_validator.AAValidatorAgent._check_call_graph_depth", return_value=(1, []))
+def test_null_paymaster_undercollateralized(mock_depth, mock_wait):
+    from core.config.settings import get_settings
+    import jwt
+    s = get_settings()
+    token = jwt.encode({"org_id": "test_org"}, s.JWT_SECRET, algorithm="HS256")
+    headers = {"Authorization": f"Bearer {token}", "x-bundler-id": "test_bundler"}
+
+    # No paymaster -> sender must pay
+    uop = make_user_op({"paymasterAndData": None, "paymaster": None})
+    
+    # Inject 0 deposit into cache to bypass RPC and simulate broke sender
+    from core.agents.aa_validator import _paymaster_deposit_cache
+    _paymaster_deposit_cache[uop["sender"]] = (0, time.time())
+
+    resp = client.post("/bundler/validate", json={"userOperation": uop}, headers=headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    
+    # Should flag undercollateralized
+    assert data["data"]["attestation"]["payload"]["decision"] in ["ESCALATE", "PAUSE"]
+    
+def test_version_mismatch():
+    from core.config.settings import get_settings
+    import jwt
+    s = get_settings()
+    token = jwt.encode({"org_id": "test_org"}, s.JWT_SECRET, algorithm="HS256")
+    headers = {"Authorization": f"Bearer {token}", "x-bundler-id": "test_bundler"}
+    
+    # Submitting v0.7 fields explicitly as wrong types (mismatching)
+    uop = make_user_op({
+        "paymasterPostOpGasLimit": "not_an_int",
+        "paymasterVerificationGasLimit": 100000
+    })
+    
+    resp = client.post("/bundler/validate", json={"userOperation": uop}, headers=headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "error"
+    assert "decision" in data["data"]
+    assert data["data"]["decision"] == "PAUSE"
+    assert "Invalid UserOperation structure" in data["data"]["reason"]

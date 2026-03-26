@@ -321,19 +321,52 @@ async def validate_user_op(request: Request, bg_tasks: __import__('fastapi').Bac
     try:
         body = await request.json()
         payload = body.get("userOperation") or body
+        dry_run = request.query_params.get("dry_run", "false").lower() == "true"
+        
         # 1. Parse and Adapt
         user_op = UserOperationParser.parse(payload)
-        chain_event = UserOperationParser.adapt_to_chain_event(user_op, bundler_id=bundler_id, org_id=org_id)
+        chain_id = int(request.headers.get("x-chain-id", "31337"))
+        entry_point = request.headers.get("x-entry-point", "0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789")
+        chain_event = UserOperationParser.adapt_to_chain_event(user_op, entry_point=entry_point, chain_id=chain_id, bundler_id=bundler_id, org_id=org_id)
         
-        # 2. Replay Protection - check early
+        # 2. Idempotency and Replay Protection - check early
+        try:
+            with get_sqlite_conn() as conn:
+                row = conn.execute("SELECT nonce, decision, risk_score, trace_hash, expires_at FROM attestation_log WHERE user_op_hash=?", (chain_event.tx_hash,)).fetchone()
+                if row:
+                    # Idempotency hit: If not expired, return cached decision natively
+                    if row["expires_at"] >= time.time():
+                        return ApiResponse(status="ok", data={
+                            "attestation": {
+                                "payload": {
+                                    "user_op_hash": chain_event.tx_hash,
+                                    "decision": row["decision"],
+                                    "risk_score": row["risk_score"],
+                                    "trace_hash": row["trace_hash"],
+                                    "bundler_id": bundler_id,
+                                    "expires_at": row["expires_at"],
+                                    "nonce": row["nonce"]
+                                },
+                                "signature": "v1=hmac-sha256:cached",
+                                "idempotent_hit": True
+                            }
+                        })
+        except Exception:
+            pass # continue fresh
+            
         AttestationService.check_and_redeem_replay(chain_event.tx_hash)
 
-        # 3. Lookup Fallback Policy
+        # 3. Lookup Fallback Policy and Chain Auth
         fallback_policy = "ESCALATE"
         with get_sqlite_conn() as conn:
-            row = conn.execute("SELECT fallback_policy FROM bundler_registry WHERE bundler_url=? OR bundler_url=?", (bundler_id, org_id)).fetchone()
+            row = conn.execute("SELECT fallback_policy, supported_chains FROM bundler_registry WHERE bundler_url=? OR bundler_url=?", (bundler_id, org_id)).fetchone()
             if row:
                 fallback_policy = row["fallback_policy"]
+                if row["supported_chains"]:
+                    allowed_chains = [c.strip() for c in row["supported_chains"].split(",")]
+                    if str(chain_id) not in allowed_chains and "*" not in allowed_chains:
+                        return ApiResponse(status="error", data={"reason": f"UNAUTHORIZED: Bundler disconnected from chain_id {chain_id}.", "decision": "PAUSE"})
+
 
         # 4. Execute MonitoringCrew (L1 only) via Flow bypass or standard kicks
         # The user requested <500ms p95. Running all L1s synchronously in an executor.
@@ -352,16 +385,21 @@ async def validate_user_op(request: Request, bg_tasks: __import__('fastapi').Bac
             final = result_state if isinstance(result_state, PramanaState) else (flow.state if hasattr(flow, "state") else state)
             
             # The action is final.action.
-            action = str(final.action).upper()
+            action_raw = getattr(final.action, "value", final.action)
+            action = str(action_raw).upper()
             score = final.risk_score
+            l1_results = [r.model_dump() for r in getattr(flow, "l1_results", [])]
             
         except asyncio.TimeoutError:
             action = fallback_policy
             score = 0.5
+            l1_results = []
             logger.warning(f"Bundler validation timeout for OPHash {chain_event.tx_hash}. Returning fallback {action}.")
             
         # 5. Save to user_operations DB
         def _save_db():
+            if dry_run: 
+                return
             try:
                 with get_sqlite_conn() as conn:
                     conn.execute(
@@ -371,7 +409,7 @@ async def validate_user_op(request: Request, bg_tasks: __import__('fastapi').Bac
                             user_op.paymaster or user_op.paymasterAndData, 
                             user_op.nonce_key, user_op.nonce_sequence, 
                             user_op.callGasLimit, user_op.verificationGasLimit, user_op.preVerificationGas, 
-                            action, score, chain_event.tx_hash, bundler_id, 31337
+                            action, score, chain_event.tx_hash, bundler_id, chain_id
                         )
                     )
             except Exception as e:
@@ -380,15 +418,21 @@ async def validate_user_op(request: Request, bg_tasks: __import__('fastapi').Bac
         bg_tasks.add_task(_save_db)
 
         # 6. Sign and Return
-        attestation = AttestationService.sign(
-            user_op_hash=chain_event.tx_hash,
-            decision=action,
-            risk_score=score,
-            trace_hash=chain_event.tx_hash,
-            bundler_id=bundler_id
-        )
+        if not dry_run:
+            attestation = AttestationService.sign(
+                user_op_hash=chain_event.tx_hash,
+                decision=action,
+                risk_score=score,
+                trace_hash=chain_event.tx_hash,
+                bundler_id=bundler_id
+            )
+        else:
+            attestation = {
+                "payload": {"decision": action, "risk_score": score, "dry_run": True}, 
+                "signature": "unsigned"
+            }
 
-        return ApiResponse(status="ok", data={"attestation": attestation})
+        return ApiResponse(status="ok", data={"attestation": attestation, "l1_results": l1_results})
 
     except MalformedUserOpError as e:
         return ApiResponse(status="error", data={"reason": str(e), "decision": "PAUSE"})
@@ -398,6 +442,27 @@ async def validate_user_op(request: Request, bg_tasks: __import__('fastapi').Bac
         # 5xx Fallback
         logger.error(f"Validation crash: {e}")
         return ApiResponse(status="error", data={"reason": "Internal Server Error", "decision": "ESCALATE"})
+
+
+class ConfirmRequest(BaseModel):
+    attestation_nonce: str
+    tx_hash: str
+
+@app.post("/bundler/confirm", response_model=ApiResponse)
+async def confirm_user_op(req: ConfirmRequest):
+    """Marks an attestation as fully consumed on L1 to finalize replay protection."""
+    from core.attestation import AttestationService
+    try:
+        with get_sqlite_conn() as conn:
+            row = conn.execute("SELECT user_op_hash FROM attestation_log WHERE attestation_nonce=?", (req.attestation_nonce,)).fetchone()
+            if row:
+                user_op_hash = row["user_op_hash"]
+                AttestationService.mark_redeemed(user_op_hash)
+                # optionally hook `tx_hash` to DB
+                return ApiResponse(status="ok", data={"redeemed": True, "user_op_hash": user_op_hash})
+        return ApiResponse(status="error", data={"reason": "attestation_nonce not found"})
+    except Exception as e:
+        return ApiResponse(status="error", data={"reason": str(e)})
 
 
 # ── Guard (pre-action hook for SDK) ──────────────────────────────────────────

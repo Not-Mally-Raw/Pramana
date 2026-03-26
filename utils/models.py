@@ -45,10 +45,12 @@ class AgentProfile(str, Enum):
 
 # ─── ERC-4337 Account Abstraction ─────────────────────────────────────────────
 
-from pydantic import model_validator
+from typing import Optional, Any, Literal
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 class UserOperation(BaseModel):
     """ERC-4337 UserOperation schema supporting both v0.6 and v0.7 structs."""
+    version: Literal["v0.6", "v0.7"] = "v0.6"
     sender: str
     nonce: int
     callData: str
@@ -90,12 +92,13 @@ class ChainEvent(BaseModel):
     agent_id:   str           # Ethereum address or identifier
     org_id:     str
     tx_hash:    str
-    action:     str           # e.g. "swap", "transfer", "call", "user_operation"
+    action:     str           # e.g. "swap", "transfer", "call", "userop"
     calldata:   str           # hex-encoded
     value_wei:  int = 0
     gas_price:  int = 0
     timestamp:  float = Field(default_factory=time.time)
     network:    str = "anvil" # anvil | sepolia | base
+    bundler_id: Optional[str] = None
     user_operation: Optional[UserOperation] = None
     metadata:   dict[str, Any] = Field(default_factory=dict)
 

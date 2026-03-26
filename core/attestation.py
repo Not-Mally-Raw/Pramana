@@ -51,8 +51,11 @@ class AttestationService:
             "nonce": attestation_nonce
         }
         
-        # Serialize deterministically for signing
-        payload_bytes = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        # Deterministic HMAC Input (Strict Ordering)
+        # HMAC input = SHA256(user_op_hash:decision:risk_score:trace_hash:bundler_id:attestation_nonce:expires_at)
+        hmac_string = f"{user_op_hash}:{decision}:{risk_score}:{trace_hash}:{bundler_id}:{attestation_nonce}:{expires_at}"
+        payload_bytes = hmac_string.encode('utf-8')
+        
         signature = hmac.new(secret, payload_bytes, hashlib.sha256).hexdigest()
         
         # Log to DB for replay protection
@@ -89,11 +92,23 @@ class AttestationService:
         if payload.get("user_op_hash") != user_op_hash:
             raise AttestationInvalidSignatureError("Attestation bound to different user_op_hash")
             
-        payload_bytes = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
-        expected_sig = hmac.new(secret, payload_bytes, hashlib.sha256).hexdigest()
-        
-        if not hmac.compare_digest(expected_sig, provided_sig):
-            raise AttestationInvalidSignatureError("Cryptographic signature mismatch")
+        # Reconstruct strict deterministic HMAC
+        try:
+            decision = payload.get("decision", "")
+            risk_score = payload.get("risk_score", 0.0)
+            trace_hash = payload.get("trace_hash", "")
+            bundler_id = payload.get("bundler_id", "")
+            attestation_nonce = payload.get("nonce", "")
+            expires_at = payload.get("expires_at", 0)
+            
+            hmac_string = f"{user_op_hash}:{decision}:{risk_score}:{trace_hash}:{bundler_id}:{attestation_nonce}:{expires_at}"
+            payload_bytes = hmac_string.encode('utf-8')
+            expected_sig = hmac.new(secret, payload_bytes, hashlib.sha256).hexdigest()
+            
+            if not hmac.compare_digest(expected_sig, provided_sig):
+                raise AttestationInvalidSignatureError("Cryptographic signature mismatch")
+        except Exception as e:
+            raise AttestationInvalidSignatureError(f"Malformed HMAC verification string: {e}")
             
         return True
 
