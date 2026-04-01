@@ -135,6 +135,45 @@ contract Guardian {
         emit TxApproved(agentId, txHash, block.timestamp);
     }
 
+    // ─── Phase 4: Pause Governance ───────────────────────────────────────────
+
+    uint256 public constant PAUSE_THRESHOLD = 2;
+    uint256 public constant EMERGENCY_THRESHOLD = 1;
+
+    mapping(bytes32 => mapping(address => bool)) public pauseVotes;
+    mapping(bytes32 => uint256) public pauseVoteCount;
+    mapping(bytes32 => bool) public pauseExecuted;
+
+    event PauseRequested(bytes32 indexed pauseId, address indexed agent, string reason);
+    event PauseVoteCast(bytes32 indexed pauseId, address indexed voter, uint256 voteCount);
+    event PauseExecuted(bytes32 indexed pauseId, address indexed agent);
+
+    /// @notice Request a pause on an agent with multisig consensus.
+    /// Emergency (score >= 0.95): 1-of-5. Standard (score 0.80-0.95): 2-of-5.
+    function requestPause(
+        address agent,
+        string calldata reason,
+        bool isEmergency,
+        bytes32 traceHash
+    ) external onlyAdmin returns (bytes32 pauseId) {
+        pauseId = keccak256(abi.encodePacked(agent, traceHash, block.number));
+        require(!pauseVotes[pauseId][msg.sender], "Guardian: already voted");
+        require(!pauseExecuted[pauseId], "Guardian: already executed");
+
+        pauseVotes[pauseId][msg.sender] = true;
+        pauseVoteCount[pauseId]++;
+
+        emit PauseVoteCast(pauseId, msg.sender, pauseVoteCount[pauseId]);
+        emit PauseRequested(pauseId, agent, reason);
+
+        uint256 required = isEmergency ? EMERGENCY_THRESHOLD : PAUSE_THRESHOLD;
+        if (pauseVoteCount[pauseId] >= required) {
+            pauseExecuted[pauseId] = true;
+            emit PauseExecuted(pauseId, agent);
+        }
+        return pauseId;
+    }
+
     // ─── Views ────────────────────────────────────────────────────────────────
 
     function getPolicy(uint256 agentId) external view returns (Policy memory) {

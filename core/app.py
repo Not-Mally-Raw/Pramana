@@ -19,6 +19,7 @@ from core.db import (
     get_sqlite_conn,
     init_duckdb,
     init_sqlite,
+    insert_lifecycle_transition,
     insert_trace,
     upsert_agent,
     upsert_policy,
@@ -97,8 +98,35 @@ import time
 import jwt
 from fastapi.responses import JSONResponse
 
-# Simple in-memory Token Bucket / Sliding Window: {org_id: (count, reset_epoch)}
-_RATE_LIMITS: dict[str, tuple[int, float]] = {}
+def _check_rate_limit_sqlite(org_id: str, limit: int = 10) -> bool:
+    """
+    Sliding window rate limiter backed by SQLite (Phase 4).
+    Window: 1 second. Persists across restarts.
+    Cleans old entries on each call.
+    Returns True if request is allowed, False if rate limited.
+    """
+    now = time.time()
+    window_start = now - 1.0
+
+    with get_sqlite_conn() as conn:
+        conn.execute(
+            "DELETE FROM rate_limit_windows WHERE org_id=? AND ts < ?",
+            (org_id, window_start)
+        )
+        count = conn.execute(
+            "SELECT COUNT(*) FROM rate_limit_windows WHERE org_id=? AND ts >= ?",
+            (org_id, window_start)
+        ).fetchone()[0]
+
+        if count >= limit:
+            return False  # Rate limited
+
+        conn.execute(
+            "INSERT INTO rate_limit_windows (org_id, ts) VALUES (?,?)",
+            (org_id, now)
+        )
+    return True
+
 
 @app.middleware("http")
 async def auth_and_rate_limit(request: Request, call_next):
@@ -123,21 +151,15 @@ async def auth_and_rate_limit(request: Request, call_next):
     except Exception as e:
         return JSONResponse(status_code=401, content={"status": "error", "detail": f"Invalid token: {e}"})
 
-    # 2. Rate Limiting: 10 req/s per organization
-    now = time.time()
-    count, reset_time = _RATE_LIMITS.get(org_id, (0, 0.0))
-    if now > reset_time:
-        # Reset 1-second window
-        _RATE_LIMITS[org_id] = (1, now + 1.0)
-    else:
-        if count >= 10:
-            return JSONResponse(status_code=429, content={"status": "error", "detail": "Rate limit exceeded (10 req/s per org). Slow down."})
-        _RATE_LIMITS[org_id] = (count + 1, reset_time)
+    # 2. Rate Limiting: 10 req/s per organization (SQLite-backed, persistent)
+    if not _check_rate_limit_sqlite(org_id, limit=10):
+        return JSONResponse(status_code=429, content={"status": "error", "detail": "Rate limit exceeded (10 req/s per org). Slow down."})
 
     # 3. Inject verified org_id into ASGI scope headers (so x_org_id=Header() dependencies work unmodified)
     headers = dict(request.scope.get("headers", []))
     headers[b"x-org-id"] = org_id.encode()
     request.scope["headers"] = [(k, v) for k, v in headers.items()]
+    request.state.org_id = org_id
 
     return await call_next(request)
 
@@ -189,6 +211,13 @@ class RegisterAgentRequest(BaseModel):
     metadata: dict = {}
 
 
+class RotateKeyRequest(BaseModel):
+    new_did: str
+    old_did: str | None = None
+    reason: str = "scheduled_rotation"
+    rotation_block: int | None = None
+
+
 @app.post("/agents/register", response_model=ApiResponse)
 async def register_agent(req: RegisterAgentRequest, x_org_id: str | None = Header(None)):
     org = _org_id(x_org_id)
@@ -222,6 +251,150 @@ async def list_agents(x_org_id: str | None = Header(None)):
             "SELECT agent_addr, did, risk_tier, paused, reputation FROM agents WHERE org_id=?", (org,)
         ).fetchall()
     return ApiResponse(status="ok", data=[dict(r) for r in rows])
+
+
+@app.post("/agents/{agent_addr}/keys/rotate", response_model=ApiResponse)
+async def rotate_agent_key(
+    agent_addr: str,
+    req: RotateKeyRequest,
+    x_org_id: str | None = Header(None),
+):
+    """Rotate an agent key/DID and reset drift baseline to avoid false positives."""
+    org = _org_id(x_org_id)
+    if req.old_did and req.old_did == req.new_did:
+        raise HTTPException(status_code=400, detail="old_did and new_did cannot be the same")
+
+    with get_sqlite_conn() as conn:
+        row = conn.execute(
+            "SELECT did, metadata FROM agents WHERE agent_addr=? AND org_id=?",
+            (agent_addr, org),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        previous_did = row["did"] or ""
+        if req.old_did and previous_did and req.old_did != previous_did:
+            raise HTTPException(status_code=409, detail="old_did does not match current DID")
+
+        metadata: dict[str, Any]
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+            if not isinstance(metadata, dict):
+                metadata = {}
+        except Exception:
+            metadata = {}
+
+        metadata["key_rotation"] = {
+            "old_did": previous_did,
+            "new_did": req.new_did,
+            "reason": req.reason,
+            "rotation_block": req.rotation_block,
+            "rotated_at_ts": int(time.time()),
+        }
+
+        conn.execute(
+            "UPDATE agents SET did=?, metadata=?, updated_at=datetime('now') WHERE agent_addr=? AND org_id=?",
+            (req.new_did, json.dumps(metadata), agent_addr, org),
+        )
+
+    baseline_reset = False
+    baseline_error = ""
+    try:
+        import chromadb
+
+        cfg = get_settings()
+        client = chromadb.PersistentClient(path=cfg.CHROMA_PATH)
+        collection_name = f"baseline_{agent_addr}_{org}"
+        try:
+            client.delete_collection(collection_name)
+            baseline_reset = True
+        except Exception as exc:
+            baseline_error = str(exc)
+    except Exception as exc:
+        baseline_error = str(exc)
+
+    try:
+        insert_lifecycle_transition(
+            agent_addr=agent_addr,
+            org_id=org,
+            from_state="ACTIVE",
+            to_state="KEY_ROTATED",
+            reason=f"key rotation: {req.reason}",
+            capital_at_risk_usd=0.0,
+        )
+    except Exception as exc:
+        logger.warning("Failed to persist key rotation lifecycle transition: %s", exc)
+
+    return ApiResponse(
+        status="ok",
+        data={
+            "agent_addr": agent_addr,
+            "org_id": org,
+            "previous_did": previous_did,
+            "new_did": req.new_did,
+            "baseline_reset": baseline_reset,
+            "baseline_reset_error": baseline_error,
+        },
+    )
+
+
+# ── Traces ────────────────────────────────────────────────────────────────────
+
+# ── Phase 3: Position Registration ─────────────────────────────────────────
+
+from utils.models import OpenPosition
+
+@app.post("/agents/{agent_id}/positions", response_model=ApiResponse)
+async def register_positions(
+    agent_id: str,
+    positions: list[OpenPosition],
+    x_org_id: str | None = Header(None)
+):
+    """Register or update open positions for an agent. Called continuously by agents."""
+    org = _org_id(x_org_id)
+    with get_sqlite_conn() as conn:
+        for pos in positions:
+            conn.execute("""
+                INSERT INTO open_positions
+                (position_id, agent_addr, org_id, protocol, position_type,
+                 asset, amount_wei, usd_value_at_entry, current_usd_value,
+                 health_factor, liquidation_threshold, chain_id,
+                 block_entered, last_updated_block, last_updated_ts,
+                 is_finalized, is_closed)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
+                ON CONFLICT(position_id) DO UPDATE SET
+                    current_usd_value=excluded.current_usd_value,
+                    health_factor=excluded.health_factor,
+                    last_updated_block=excluded.last_updated_block,
+                    last_updated_ts=excluded.last_updated_ts,
+                    is_finalized=excluded.is_finalized
+            """, (
+                pos.position_id, agent_id, org, pos.protocol,
+                pos.position_type.value, pos.asset, str(pos.amount_wei),
+                pos.usd_value_at_entry, pos.current_usd_value,
+                pos.health_factor, pos.liquidation_threshold,
+                pos.chain_id, pos.block_entered,
+                pos.last_updated_block, pos.last_updated_ts,
+                int(pos.is_finalized)
+            ))
+    return ApiResponse(status="ok", data={"registered": len(positions), "agent_id": agent_id})
+
+
+@app.delete("/agents/{agent_id}/positions/{position_id}", response_model=ApiResponse)
+async def close_position(
+    agent_id: str,
+    position_id: str,
+    x_org_id: str | None = Header(None)
+):
+    """Mark a position as closed."""
+    org = _org_id(x_org_id)
+    with get_sqlite_conn() as conn:
+        conn.execute(
+            "UPDATE open_positions SET is_closed=1, closed_ts=? "
+            "WHERE position_id=? AND agent_addr=? AND org_id=?",
+            (int(time.time()), position_id, agent_id, org)
+        )
+    return ApiResponse(status="ok", data={"closed": position_id})
 
 
 # ── Traces ────────────────────────────────────────────────────────────────────
@@ -332,25 +505,39 @@ async def validate_user_op(request: Request, bg_tasks: __import__('fastapi').Bac
         # 2. Idempotency and Replay Protection - check early
         try:
             with get_sqlite_conn() as conn:
-                row = conn.execute("SELECT nonce, decision, risk_score, trace_hash, expires_at FROM attestation_log WHERE user_op_hash=?", (chain_event.tx_hash,)).fetchone()
+                row = conn.execute(
+                    "SELECT nonce, decision, risk_score, trace_hash, bundler_id, expires_at, expires_at_block, redeemed "
+                    "FROM attestation_log WHERE user_op_hash=?",
+                    (chain_event.tx_hash,),
+                ).fetchone()
                 if row:
-                    # Idempotency hit: If not expired, return cached decision natively
-                    if row["expires_at"] >= time.time():
-                        return ApiResponse(status="ok", data={
-                            "attestation": {
-                                "payload": {
-                                    "user_op_hash": chain_event.tx_hash,
-                                    "decision": row["decision"],
-                                    "risk_score": row["risk_score"],
-                                    "trace_hash": row["trace_hash"],
-                                    "bundler_id": bundler_id,
-                                    "expires_at": row["expires_at"],
-                                    "nonce": row["nonce"]
-                                },
-                                "signature": "v1=hmac-sha256:cached",
-                                "idempotent_hit": True
-                            }
-                        })
+                    if not row["redeemed"]:
+                        # Idempotency hit: accept if block expiry is still valid, else fallback to legacy wall-clock expiry.
+                        now_block = AttestationService.get_current_block()
+                        expires_at_block = row["expires_at_block"] or 0
+                        expires_at = row["expires_at"] or 0
+                        is_valid = (
+                            (expires_at_block > 0 and now_block <= expires_at_block)
+                            or (expires_at >= time.time())
+                        )
+
+                        if is_valid:
+                            return ApiResponse(status="ok", data={
+                                "attestation": {
+                                    "payload": {
+                                        "user_op_hash": chain_event.tx_hash,
+                                        "decision": row["decision"],
+                                        "risk_score": row["risk_score"],
+                                        "trace_hash": row["trace_hash"],
+                                        "bundler_id": row["bundler_id"] or bundler_id,
+                                        "expires_at": expires_at,
+                                        "expires_at_block": expires_at_block,
+                                        "nonce": row["nonce"]
+                                    },
+                                    "signature": "v1=hmac-sha256:cached",
+                                    "idempotent_hit": True
+                                }
+                            })
         except Exception:
             pass # continue fresh
             
@@ -454,7 +641,7 @@ async def confirm_user_op(req: ConfirmRequest):
     from core.attestation import AttestationService
     try:
         with get_sqlite_conn() as conn:
-            row = conn.execute("SELECT user_op_hash FROM attestation_log WHERE attestation_nonce=?", (req.attestation_nonce,)).fetchone()
+            row = conn.execute("SELECT user_op_hash FROM attestation_log WHERE nonce=?", (req.attestation_nonce,)).fetchone()
             if row:
                 user_op_hash = row["user_op_hash"]
                 AttestationService.mark_redeemed(user_op_hash)

@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
 /// @title Pramãna Reputation SBT (Soulbound Token)
 /// @notice Non-transferable ERC-721-like token tracking agent reputation scores.
 ///         Scores (success_rate, roi, uptime, halluc_rate) are stored as packed uint16s
 ///         to minimize gas. One SBT per registered agent address.
 ///         Batch updates via multicall pattern to minimize tx count.
-contract ReputationSBT {
+contract ReputationSBT is ReentrancyGuard {
     // ─── Structs ──────────────────────────────────────────────────────────────
 
     struct ReputationScore {
@@ -135,7 +137,7 @@ contract ReputationSBT {
         uint16[]  calldata roiScores,
         uint16[]  calldata uptimeScores,
         uint16[]  calldata hallucRates
-    ) external onlyAdmin {
+    ) external onlyAdmin nonReentrant {
         uint256 len = tokenIds.length;
         require(
             successRates.length == len &&

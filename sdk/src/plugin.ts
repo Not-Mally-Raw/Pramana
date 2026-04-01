@@ -9,6 +9,11 @@ import { PramanaGuard } from "./guard";
 import { CoTCapture } from "./trace";
 import type { PramanaConfig } from "./types";
 
+type RuntimePlugin = Plugin & {
+  initialize?: (runtime: IAgentRuntime) => Promise<void>;
+  handlers?: Record<string, (params: Record<string, unknown>) => Promise<void>>;
+};
+
 export interface PramanaPluginOptions {
   apiUrl?: string;       // default: http://localhost:8000
   orgId?: string;        // required
@@ -36,7 +41,7 @@ export function createPramanaPlugin(opts: PramanaPluginOptions = {}): Plugin {
   let guard: PramanaGuard | null = null;
   const activeCaptures = new Map<string, CoTCapture>();
 
-  return {
+  const plugin: RuntimePlugin = {
     name: "@pramana/eliza-plugin",
     description: "Pramana on-chain AgentOps: pre-action guard + trace emission",
 
@@ -97,6 +102,8 @@ export function createPramanaPlugin(opts: PramanaPluginOptions = {}): Plugin {
       },
     },
   };
+
+  return plugin as Plugin;
 }
 
 /** Default plugin export for direct use in character files. */

@@ -5,13 +5,16 @@
 export interface ChainEvent {
   agentId: string;
   orgId: string;
-  txHash?: string;
+  txHash: string;
   action: string;
-  calldata?: string;
+  calldata: string;
   valueWei?: number;
   gasPrice?: number;
   network?: string;
-  timestamp?: string;
+  timestamp?: number;
+  bundlerId?: string;
+  userOperation?: UserOperation;
+  metadata?: Record<string, unknown>;
 }
 
 export interface L1Result {
@@ -44,9 +47,51 @@ export interface CouncilResult {
   reason: string;
   votes: CouncilVote[];
   quorumMet: boolean;
+  degraded?: boolean;
 }
 
-export type FlowAction = "PASS" | "ESCALATE" | "PAUSE" | "EMERGENCY";
+export type FlowAction = "pass" | "escalate" | "pause" | "emergency";
+export type DegradedMode = "normal" | "no_llm" | "no_chain" | "no_vectors";
+
+export interface UserOperation {
+  version?: "v0.6" | "v0.7";
+  sender: string;
+  nonce: number;
+  callData: string;
+  callGasLimit: number;
+  verificationGasLimit: number;
+  preVerificationGas: number;
+  maxFeePerGas: number;
+  maxPriorityFeePerGas: number;
+  signature: string;
+  initCode?: string;
+  paymasterAndData?: string;
+  factory?: string;
+  factoryData?: string;
+  paymaster?: string;
+  paymasterVerificationGasLimit?: number;
+  paymasterPostOpGasLimit?: number;
+  paymasterData?: string;
+  nonceKey?: number;
+  nonceSequence?: number;
+}
+
+export interface PramanaState {
+  event?: ChainEvent;
+  l1Results: L1Result[];
+  flagCount: number;
+  riskScore: number;
+  action: FlowAction;
+  finalDecisionReason: string;
+  councilResult?: CouncilResult;
+  traceDagJson: string;
+  traceHash: string;
+  degradedMode: DegradedMode;
+  flowId: string;
+  agentProfile: string;
+  openPositions?: Array<Record<string, unknown>>;
+  agentStake: number;
+}
 
 export interface TraceNode {
   name: string;
@@ -101,6 +146,7 @@ export interface GuardCheckResponse {
 }
 
 export interface ApiResponse<T = unknown> {
+  success?: boolean;
   status: string;
   data: T;
   error?: string;

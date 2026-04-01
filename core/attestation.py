@@ -7,7 +7,6 @@ from __future__ import annotations
 import hmac
 import hashlib
 import time
-import json
 from typing import Optional
 
 from core.db import get_sqlite_conn
@@ -26,20 +25,36 @@ class AttestationInvalidSignatureError(Exception):
 
 class AttestationService:
     @staticmethod
-    def sign(user_op_hash: str, decision: str, risk_score: float, trace_hash: str, bundler_id: str, ttl_seconds: int = 60) -> dict:
+    def get_current_block() -> Optional[int]:
+        """Fetch current block number from active RPC, if available."""
+        try:
+            from web3 import Web3
+
+            s = get_settings()
+            w3 = Web3(Web3.HTTPProvider(s.active_rpc, request_kwargs={"timeout": 2}))
+            if not w3.is_connected():
+                return None
+            return int(w3.eth.block_number)
+        except Exception:
+            return None
+
+    @staticmethod
+    def sign(user_op_hash: str, decision: str, risk_score: float, trace_hash: str, bundler_id: str, ttl_blocks: int = 5) -> dict:
         """
         Generates an HMAC-SHA256 signature binding the decision to the specific UserOperation.
         Logs the attestation to SQLite for replay protection.
         """
         s = get_settings()
         secret = s.ATTESTATION_HMAC_SECRET.encode('utf-8')
-        
-        expires_at = int(time.time()) + ttl_seconds
+
+        current_block = AttestationService.get_current_block()
+        expires_at_block = (current_block + ttl_blocks) if current_block is not None else 0
+        expires_at = int(time.time()) + 60  # legacy fallback for payload compatibility
         
         # We need a unique nonce for the attestation itself
         # user_op_hash acts as the primary idempotency key.
         from utils.crypto import keccak256_hex
-        attestation_nonce = keccak256_hex(f"{user_op_hash}:{expires_at}:{trace_hash}")
+        attestation_nonce = keccak256_hex(f"{user_op_hash}:{expires_at_block}:{trace_hash}")
 
         payload = {
             "user_op_hash": user_op_hash,
@@ -47,13 +62,13 @@ class AttestationService:
             "risk_score": risk_score,
             "trace_hash": trace_hash,
             "bundler_id": bundler_id,
+            "expires_at_block": expires_at_block,
             "expires_at": expires_at,
             "nonce": attestation_nonce
         }
         
-        # Deterministic HMAC Input (Strict Ordering)
-        # HMAC input = SHA256(user_op_hash:decision:risk_score:trace_hash:bundler_id:attestation_nonce:expires_at)
-        hmac_string = f"{user_op_hash}:{decision}:{risk_score}:{trace_hash}:{bundler_id}:{attestation_nonce}:{expires_at}"
+        # Deterministic HMAC Input (Strict Ordering, block-aware expiry).
+        hmac_string = f"{user_op_hash}:{decision}:{risk_score}:{trace_hash}:{bundler_id}:{attestation_nonce}:{expires_at_block}"
         payload_bytes = hmac_string.encode('utf-8')
         
         signature = hmac.new(secret, payload_bytes, hashlib.sha256).hexdigest()
@@ -61,9 +76,23 @@ class AttestationService:
         # Log to DB for replay protection
         with get_sqlite_conn() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO attestation_log (user_op_hash, attestation_nonce, redeemed, expires_at) "
-                "VALUES (?, ?, 0, ?)",
-                (user_op_hash, attestation_nonce, expires_at)
+                """
+                INSERT OR REPLACE INTO attestation_log
+                  (user_op_hash, attestation_nonce, nonce, decision, risk_score, trace_hash, bundler_id,
+                   redeemed, expires_at, expires_at_block, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, datetime('now'))
+                """,
+                (
+                    user_op_hash,
+                    attestation_nonce,
+                    attestation_nonce,
+                    decision,
+                    float(risk_score),
+                    trace_hash,
+                    bundler_id,
+                    expires_at,
+                    expires_at_block,
+                ),
             )
             
         return {
@@ -83,10 +112,17 @@ class AttestationService:
             raise AttestationInvalidSignatureError("Unsupported signature version")
             
         provided_sig = signature_header.split(":")[1]
-        
-        # Verify TTL
-        if payload.get("expires_at", 0) < time.time():
-            raise AttestationExpiredError("Attestation has expired")
+
+        # Verify TTL using block-based expiration when available.
+        expires_at_block = int(payload.get("expires_at_block", 0) or 0)
+        if expires_at_block > 0:
+            current_block = AttestationService.get_current_block()
+            if current_block is None or current_block > expires_at_block:
+                raise AttestationExpiredError("Attestation has expired (block TTL)")
+        else:
+            # Legacy fallback for old payloads.
+            if payload.get("expires_at", 0) < time.time():
+                raise AttestationExpiredError("Attestation has expired")
             
         # Verify binding
         if payload.get("user_op_hash") != user_op_hash:
@@ -99,9 +135,9 @@ class AttestationService:
             trace_hash = payload.get("trace_hash", "")
             bundler_id = payload.get("bundler_id", "")
             attestation_nonce = payload.get("nonce", "")
-            expires_at = payload.get("expires_at", 0)
+            expires_at_block = int(payload.get("expires_at_block", 0) or 0)
             
-            hmac_string = f"{user_op_hash}:{decision}:{risk_score}:{trace_hash}:{bundler_id}:{attestation_nonce}:{expires_at}"
+            hmac_string = f"{user_op_hash}:{decision}:{risk_score}:{trace_hash}:{bundler_id}:{attestation_nonce}:{expires_at_block}"
             payload_bytes = hmac_string.encode('utf-8')
             expected_sig = hmac.new(secret, payload_bytes, hashlib.sha256).hexdigest()
             
@@ -122,20 +158,14 @@ class AttestationService:
         with get_sqlite_conn() as conn:
             # Check existence and redeemed status
             row = conn.execute(
-                "SELECT redeemed, expires_at FROM attestation_log WHERE user_op_hash=?", 
+                "SELECT redeemed, expires_at_block FROM attestation_log WHERE user_op_hash=?", 
                 (user_op_hash,)
             ).fetchone()
             
             if row:
                 if row["redeemed"]:
                     raise AttestationReplayError(f"UserOpHash {user_op_hash} already evaluated and redeemed")
-                # If it's there but not redeemed, it might be an active validation in flight or previously evaluated but timed out.
-                # Usually bundlers don't ask twice for a valid hash.
-                
-            # We don't mark it redeemed HERE, we mark it redeemed when the bundler actually submits the block!
-            # Wait, the prompt says: "check attestation_log at request start, mark redeemed=True on confirmation"
-            # Actually, the API intercepts it. "If a user_op_hash is already in the log with redeemed=True, reject immediately"
-            # If we receive a POST /bundler/validate, we can just check if it's already in the log.
+
             if row and row["redeemed"]:
                 raise AttestationReplayError(f"Replay Attempt: {user_op_hash}")
 

@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from core.config.settings import get_settings
 from dashboard.components.monitor_settings import open_monitor_settings_dialog
 from dashboard.components.theme import apply_theme, footer, schedule_rerun
-from dashboard.views import agents, evaluations, forge, overview
+from dashboard.views import agents, evaluations, forge, overview, recovery, pipeline, lifecycle
 
 
 def _sidebar(settings) -> tuple[str, str, object, object]:
@@ -35,7 +35,7 @@ def _sidebar(settings) -> tuple[str, str, object, object]:
         st.markdown("#### Navigation")
         page = st.radio(
             "Pages",
-            ["Dashboard", "Agents", "Monitor Settings", "Evaluations", "Forge"],
+            ["Dashboard", "Agents", "Pipeline Latency", "Recovery Alerts", "Agent Lifecycle", "Monitor Settings", "Evaluations", "Forge"],
             label_visibility="collapsed",
         )
 
@@ -64,6 +64,12 @@ def main() -> None:
         overview.render(org_id, date_choice, custom_start, custom_end)
     elif page == "Agents":
         agents.render(org_id)
+    elif page == "Pipeline Latency":
+        pipeline.render(org_id, date_choice, custom_start, custom_end)
+    elif page == "Recovery Alerts":
+        recovery.render(org_id, date_choice, custom_start, custom_end)
+    elif page == "Agent Lifecycle":
+        lifecycle.render()
     elif page == "Monitor Settings":
         st.subheader("Monitor Settings")
         st.write("Use the button below to open the full settings panel.")

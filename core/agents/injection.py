@@ -159,9 +159,10 @@ class InjectionAgent(BaseL1Agent):
             return calldata  # Already plaintext or empty
 
         hex_str = calldata[2:]  # Strip 0x prefix
-        try:
-            raw_bytes = bytes.fromhex(hex_str)
-        except ValueError:
+        from core.parsers.calldata import _safe_hex_bytes
+
+        raw_bytes = _safe_hex_bytes(hex_str)
+        if not raw_bytes:
             return calldata  # Invalid hex, return as-is
 
         # Strategy 1: Full UTF-8 decode (works if entire payload is text)

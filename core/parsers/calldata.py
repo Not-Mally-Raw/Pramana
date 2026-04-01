@@ -15,6 +15,23 @@ from eth_utils import function_abi_to_4byte_selector, encode_hex
 
 logger = logging.getLogger("pramana.parser")
 
+
+def _safe_hex_bytes(hex_str: str) -> bytes:
+    """
+    Safely convert hex string to bytes.
+    Returns empty bytes on any failure — never raises.
+    Handles: 0x-prefixed, unprefixed, odd-length, non-hex, None.
+    """
+    if not hex_str:
+        return b""
+    try:
+        clean = str(hex_str).replace("0x", "").replace(" ", "").strip()
+        if len(clean) % 2 != 0:
+            clean = "0" + clean
+        return bytes.fromhex(clean)
+    except (ValueError, AttributeError, TypeError):
+        return b""
+
 class DecodedCall(BaseModel):
     """Structured representation of a decoded transaction call."""
     selector: str
@@ -61,7 +78,7 @@ class CalldataParser:
             calldata = calldata[2:]
 
         selector = calldata[:8]
-        args_data = bytes.fromhex(calldata[8:])
+        args_data = _safe_hex_bytes(calldata[8:])
 
         if selector not in self._registry:
             return None

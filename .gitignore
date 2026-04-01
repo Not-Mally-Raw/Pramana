@@ -5,3 +5,5 @@ __pycache__/
 *.sqlite3
 *.duckdb
 data/
+sdk/node_modules/
+sdk/dist/

@@ -49,6 +49,8 @@ class ValidatorAgent(BaseL1Agent):
         score = 0.0
 
         from core.parsers.calldata import decode_all_calls
+        parsed_payload = self._parse_calldata(event.calldata or "")
+        meta["payload_parsed"] = isinstance(parsed_payload, dict)
         
         # ── ABI Calldata Parsing ──────────────────────────────────────────
         calls = decode_all_calls(event.calldata or "")
@@ -68,14 +70,42 @@ class ValidatorAgent(BaseL1Agent):
                     score = max(score, 0.80)
         else:
             # Fallback for unrecognized/opaque calldata
-            if event.calldata and len(event.calldata) > 10:
+            if parsed_payload is None and event.calldata and len(event.calldata) > 10:
                 issues.append("opaque/unrecognized calldata payload")
                 score = max(score, 0.40)
+
+        # ── JSON schema fallback for plain calldata payloads ──────────────
+        normalized_action = (event.action or "").lower()
+        schema = _SCHEMAS.get(normalized_action)
+        if isinstance(parsed_payload, dict) and schema:
+            missing = [field for field in schema.get("required", []) if field not in parsed_payload]
+            if missing:
+                issues.append(f"missing required fields: {', '.join(missing)}")
+                score = max(score, 0.85)
+
+            for field, rules in schema.get("properties", {}).items():
+                if field not in parsed_payload:
+                    continue
+                pattern = rules.get("pattern")
+                value = str(parsed_payload.get(field, ""))
+                if pattern:
+                    import re
+
+                    if not re.match(pattern, value):
+                        issues.append(f"invalid {field} format")
+                        score = max(score, 0.85)
 
         # ── Deep Address Validation ───────────────────────────────────────
         all_addresses = set()
         for c in calls:
             all_addresses.update(c.addresses)
+
+        if isinstance(parsed_payload, dict):
+            for key, value in parsed_payload.items():
+                if not isinstance(value, str):
+                    continue
+                if key.lower() in {"to", "from", "spender", "token", "token_in", "token_out", "recipient", "receiver", "owner"}:
+                    all_addresses.add(value)
             
         invalid_addrs = [a for a in all_addresses if not self._is_valid_address(a)]
         if invalid_addrs:
@@ -124,8 +154,12 @@ class ValidatorAgent(BaseL1Agent):
         except (json.JSONDecodeError, ValueError):
             pass
         if calldata.startswith("0x"):
+            from core.parsers.calldata import _safe_hex_bytes
             try:
-                decoded = bytes.fromhex(calldata[2:]).decode("utf-8", errors="ignore")
+                raw = _safe_hex_bytes(calldata[2:])
+                if not raw:
+                    return None
+                decoded = raw.decode("utf-8", errors="ignore")
                 return json.loads(decoded)
             except Exception:
                 pass

@@ -5,12 +5,22 @@ No hardcoding. Dynamic: settings reload on SIGHUP or via API endpoint.
 from __future__ import annotations
 
 import json
-import os
 from functools import lru_cache
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_INSECURE_SECRET_MARKERS = {
+    "",
+    "changeme",
+    "change_me",
+    "default_secret_key_change_in_production_2026",
+    "default_hmac_secret_change_in_production_2026",
+}
 
 
 class Settings(BaseSettings):
@@ -25,8 +35,8 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     DEBUG:       bool = False
     LOG_LEVEL:   str = "INFO"
-    JWT_SECRET:  str = "default_secret_key_change_in_production_2026"
-    ATTESTATION_HMAC_SECRET: str = "default_hmac_secret_change_in_production_2026"
+    JWT_SECRET:  str = ""
+    ATTESTATION_HMAC_SECRET: str = ""
 
     # ── Network ──────────────────────────────────────────────────────────────
     NETWORK:           str = "anvil"         # anvil | sepolia | base
@@ -157,6 +167,25 @@ class Settings(BaseSettings):
     @property
     def is_testnet(self) -> bool:
         return self.NETWORK in ("anvil", "sepolia")
+
+    @model_validator(mode="after")
+    def _validate_runtime_secrets(self) -> "Settings":
+        """Fail fast on insecure secret defaults outside local anvil mode."""
+        if self.NETWORK != "anvil":
+            if self.JWT_SECRET in _INSECURE_SECRET_MARKERS:
+                raise ValueError("JWT_SECRET must be explicitly set for non-anvil networks")
+            if self.ATTESTATION_HMAC_SECRET in _INSECURE_SECRET_MARKERS:
+                raise ValueError("ATTESTATION_HMAC_SECRET must be explicitly set for non-anvil networks")
+            return self
+
+        # Local mode fallback: deterministic per workspace to keep local tooling interoperable.
+        seed = f"{self.NETWORK}:{self.SQLITE_PATH}:{Path(__file__).resolve().parents[2]}".encode("utf-8")
+        digest = sha256(seed).hexdigest()
+        if self.JWT_SECRET in _INSECURE_SECRET_MARKERS:
+            self.JWT_SECRET = f"dev-jwt-{digest[:48]}"
+        if self.ATTESTATION_HMAC_SECRET in _INSECURE_SECRET_MARKERS:
+            self.ATTESTATION_HMAC_SECRET = f"dev-hmac-{digest[16:64]}"
+        return self
 
 
 @lru_cache(maxsize=1)

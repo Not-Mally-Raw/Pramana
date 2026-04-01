@@ -104,21 +104,35 @@ class PramanaFlow(Flow[PramanaState]):
         # 1) Declarative routing from DB-backed routing_table (hot-reloadable)
         route = self._route_from_rules(state)
         if route:
+            state.final_decision_reason = f"routing_rule:{route}"
             return route
 
         # 2) Fallback hard thresholds if no rule matched
         if state.flag_count >= s.ESCALATION_FLAG_THRESHOLD:
+            state.final_decision_reason = (
+                f"flag_count {state.flag_count} >= {s.ESCALATION_FLAG_THRESHOLD}"
+            )
             return "escalate"
         if state.risk_score >= s.RISK_SCORE_PAUSE:
+            state.final_decision_reason = (
+                f"risk_score {state.risk_score:.3f} >= pause_threshold {s.RISK_SCORE_PAUSE:.3f}"
+            )
             return "pause"
         if state.risk_score >= s.RISK_SCORE_ESCALATE:
+            state.final_decision_reason = (
+                f"risk_score {state.risk_score:.3f} >= escalate_threshold {s.RISK_SCORE_ESCALATE:.3f}"
+            )
             return "escalate"
 
         # Injection hard-pause fallback
         injection_result = next((r for r in state.l1_results if r.agent_name == "injection"), None)
         if injection_result and injection_result.flagged and injection_result.score >= 0.85:
+            state.final_decision_reason = (
+                f"injection hard-pause fallback score={injection_result.score:.3f}"
+            )
             return "pause"
 
+        state.final_decision_reason = "no escalation thresholds matched"
         return "pass"
 
     # ── Step 4A: Escalate (L2 Council) ───────────────────────────────────────
@@ -128,6 +142,9 @@ class PramanaFlow(Flow[PramanaState]):
         """Run L2 InterventionCrew: Council + Recovery + Reputation."""
         state = self.state
         state = self._crews.run_intervention(state)
+
+        if state.council_result and state.council_result.reason:
+            state.final_decision_reason = state.council_result.reason
 
         # Update TraceDAG with council node
         dag = TraceDAG.from_json(state.trace_dag_json)
@@ -150,11 +167,72 @@ class PramanaFlow(Flow[PramanaState]):
         """Emergency pause: write to contract and set action = PAUSE."""
         state = self.state
         state.action = FlowAction.PAUSE
+        if not state.final_decision_reason:
+            state.final_decision_reason = "escalation_router: pause path"
 
         dag = TraceDAG.from_json(state.trace_dag_json)
         dag.add_node("emergency_pause", action="pause", score=1.0, flagged=True,
                      metadata={"reason": "escalation_router: pause path"})
         state.trace_dag_json = dag.to_json()
+
+        # Phase 4: Guardian multisig vote (executes in parallel, non-blocking)
+        try:
+            if state.event and state.trace_hash:
+                guardian_voted = self._request_pause_via_guardian(
+                    agent_addr=state.event.agent_id,
+                    trace_hash=state.trace_hash or "",
+                    risk_score=state.risk_score or 0.0,
+                    reason=state.final_decision_reason or "L1/L2 escalation"
+                )
+                if not guardian_voted:
+                    import logging
+                    logging.getLogger("pramana.flow").info(
+                        f"Guardian vote skipped for {state.event.agent_id} — executing direct pause via Orchestrator"
+                    )
+        except Exception as e:
+            import logging
+            logging.getLogger("pramana.flow").warning(f"Guardian vote failed: {e}")
+            # Do NOT re-raise — Guardian failure must not block the pause
+
+        # Phase 3: Financial recovery alert generation
+        try:
+            if state.event:
+                from core.agents.financial_recovery import (
+                    FinancialRecoveryService,
+                    _persist_recovery_alert,
+                    _fetch_open_positions,
+                    _get_operator_webhook
+                )
+                from core.config.settings import get_settings as _gs
+                import asyncio as _asyncio
+
+                _s = _gs()
+                positions = _fetch_open_positions(state.event.agent_id, state.event.org_id)
+                if positions:
+                    recovery_svc = FinancialRecoveryService()
+                    alert = recovery_svc.generate_alert(
+                        agent_addr=state.event.agent_id,
+                        org_id=state.event.org_id,
+                        trace_hash=state.trace_hash or "",
+                        positions=positions,
+                        rpc_url=_s.active_rpc
+                    )
+                    _persist_recovery_alert(alert)
+                    state.recovery_alert = alert
+
+                    # Non-blocking webhook delivery
+                    webhook_url = _get_operator_webhook(state.event.org_id)
+                    if webhook_url:
+                        _asyncio.create_task(
+                            recovery_svc.deliver_webhook(alert, webhook_url)
+                        )
+        except Exception as e:
+            import logging
+            logging.getLogger("pramana.flow").error(
+                f"Recovery alert generation failed for {state.event.agent_id if state.event else 'unknown'}: {e}"
+            )
+            # Do NOT re-raise — recovery alert failure must not block the pause
+
         return state
 
     # ── Step 4C: Pass ─────────────────────────────────────────────────────────
@@ -164,6 +242,8 @@ class PramanaFlow(Flow[PramanaState]):
         """Clean path: log trace and continue."""
         state = self.state
         state.action = FlowAction.PASS
+        if not state.final_decision_reason:
+            state.final_decision_reason = "escalation_router: pass path"
         return state
 
     # ── Step 5: Finalize (common terminal step) ───────────────────────────────
@@ -220,6 +300,91 @@ class PramanaFlow(Flow[PramanaState]):
             self._emit_trace_finalized(state)
 
         return state
+
+    @staticmethod
+    def _request_pause_via_guardian(
+        agent_addr: str,
+        trace_hash: str,
+        risk_score: float,
+        reason: str
+    ) -> bool:
+        """
+        Submit a pause vote to Guardian.sol multisig contract.
+        
+        Threshold rules (matches Guardian.sol constants):
+        - Emergency (risk_score >= 0.95): EMERGENCY_THRESHOLD = 1 signature required
+        - Standard  (risk_score < 0.95):  PAUSE_THRESHOLD = 2 signatures required
+        
+        This backend wallet is one of the council members. In production,
+        other council members (human operators, DAO multisig) cast additional
+        votes. For testnet, a single wallet can trigger emergency pauses.
+        
+        FALLBACK: If Guardian is unreachable or not deployed, logs the error
+        and returns False. The caller must handle this — the pause must still
+        execute via the existing Orchestrator path as fallback.
+        """
+        import logging
+        import json
+        logger = logging.getLogger("pramana.guardian")
+        
+        from core.config.settings import get_settings as _gs
+        s = _gs()
+        
+        # If Guardian address not configured, skip silently
+        guardian_addr = getattr(s, "GUARDIAN_ADDR", "") or ""
+        if not guardian_addr or guardian_addr == "0x0000000000000000000000000000000000000000":
+            logger.warning("GUARDIAN_ADDR not configured — skipping Guardian vote, using direct pause")
+            return False
+        
+        is_emergency = risk_score >= 0.95
+        
+        GUARDIAN_ABI = json.loads('[{"inputs":[{"name":"agent","type":"address"},{"name":"reason","type":"string"},{"name":"isEmergency","type":"bool"},{"name":"traceHash","type":"bytes32"}],"name":"requestPause","outputs":[{"name":"pauseId","type":"bytes32"}],"stateMutability":"nonpayable","type":"function"}]')
+        
+        try:
+            from web3 import Web3
+            w3 = Web3(Web3.HTTPProvider(s.active_rpc, request_kwargs={"timeout": 10}))
+            
+            if not w3.is_connected():
+                logger.error("RPC not connected — Guardian pause skipped")
+                return False
+            
+            guardian = w3.eth.contract(
+                address=Web3.to_checksum_address(guardian_addr),
+                abi=GUARDIAN_ABI
+            )
+            acct = w3.eth.account.from_key(s.DEPLOYER_KEY)
+            
+            # Pad trace_hash to 32 bytes for bytes32 parameter
+            clean_hash = trace_hash.replace("0x", "").ljust(64, "0")[:64]
+            trace_bytes = bytes.fromhex(clean_hash)
+            
+            tx = guardian.functions.requestPause(
+                Web3.to_checksum_address(agent_addr),
+                reason[:200],
+                is_emergency,
+                trace_bytes
+            ).build_transaction({
+                "from": acct.address,
+                "nonce": w3.eth.get_transaction_count(acct.address),
+                "gas": 200000,
+                "maxFeePerGas": w3.eth.gas_price * 2,
+                "maxPriorityFeePerGas": w3.eth.gas_price,
+            })
+            
+            signed = acct.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+            
+            if receipt.status == 1:
+                logger.info(f"Guardian pause vote submitted for {agent_addr} — tx {tx_hash.hex()}")
+                return True
+            else:
+                logger.error(f"Guardian pause tx reverted for {agent_addr}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Guardian.requestPause failed for {agent_addr}: {e}")
+            return False
 
     @staticmethod
     def _emit_trace_finalized(state: PramanaState) -> None:

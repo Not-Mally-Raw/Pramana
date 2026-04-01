@@ -65,6 +65,21 @@ class EconomicSanityAgent(BaseL1Agent):
             issues.append(f"mev_risk {mev_risk_score:.2f} > 0.70")
             score = max(score, 0.55)
 
+        pga_score, pga_median_gas, pga_bid_ratio, pga_spike_count = self._check_pga_participation(
+            event.agent_id,
+            event.org_id,
+            event.gas_price,
+        )
+        meta["pga_participation_score"] = round(pga_score, 3)
+        meta["pga_median_gas_price"] = int(pga_median_gas)
+        meta["pga_bid_ratio"] = round(pga_bid_ratio, 3)
+        meta["pga_spike_count"] = pga_spike_count
+        if pga_score > 0.65:
+            issues.append(
+                f"pga_participation score {pga_score:.2f} (ratio {pga_bid_ratio:.2f}, spikes {pga_spike_count})"
+            )
+            score = max(score, 0.65)
+
         token_risk_flags = self._check_token_risk(event.calldata or "")
         meta["token_risk_flags"] = token_risk_flags
         if token_risk_flags > 0:
@@ -150,8 +165,9 @@ class EconomicSanityAgent(BaseL1Agent):
         exists in SQLite. DuckDB has 'agent_metrics'. Changed to SQLite.
         """
         try:
-            from core.db import get_conn
-            with get_conn() as conn:
+            from core.db import get_sqlite_conn
+
+            with get_sqlite_conn() as conn:
                 row = conn.execute(
                     "SELECT MAX(created_at) FROM events WHERE agent_addr=? AND org_id=?",
                     [agent_id, org_id]
@@ -252,6 +268,63 @@ class EconomicSanityAgent(BaseL1Agent):
         if value_eth > 10:
             return min(0.70, 0.20 + (value_eth / 100.0))
         return 0.15
+
+    @staticmethod
+    def _check_pga_participation(agent_id: str, org_id: str, current_gas_price: int) -> tuple[float, float, float, int]:
+        """Estimate PGA participation from gas bidding pressure vs historical median."""
+        if current_gas_price <= 0:
+            return 0.0, 0.0, 0.0, 0
+
+        try:
+            from core.db import get_sqlite_conn
+
+            with get_sqlite_conn() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT gas_price
+                    FROM events
+                    WHERE agent_addr=?
+                      AND org_id=?
+                      AND gas_price IS NOT NULL
+                      AND gas_price != ''
+                    ORDER BY created_at DESC
+                    LIMIT 50
+                    """,
+                    [agent_id, org_id],
+                ).fetchall()
+
+            prices: list[float] = []
+            for row in rows:
+                try:
+                    prices.append(float(row[0]))
+                except Exception:
+                    continue
+
+            if len(prices) < 5:
+                return 0.0, 0.0, 0.0, 0
+
+            sorted_prices = sorted(prices)
+            mid = len(sorted_prices) // 2
+            median_gas = (
+                sorted_prices[mid]
+                if len(sorted_prices) % 2 == 1
+                else (sorted_prices[mid - 1] + sorted_prices[mid]) / 2
+            )
+            if median_gas <= 0:
+                return 0.0, 0.0, 0.0, 0
+
+            bid_ratio = current_gas_price / median_gas
+            ratio_score = 0.0
+            if bid_ratio > 1.25:
+                ratio_score = min(1.0, (bid_ratio - 1.25) / 1.75)
+
+            recent_window = prices[:10]
+            spike_count = sum(1 for gas in recent_window if gas >= median_gas * 1.8)
+            burst_score = min(1.0, spike_count / 4.0)
+
+            return max(ratio_score, burst_score), median_gas, bid_ratio, spike_count
+        except Exception:
+            return 0.0, 0.0, 0.0, 0
 
     @staticmethod
     def _check_token_risk(calldata: str) -> int:

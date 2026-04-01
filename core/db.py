@@ -28,6 +28,7 @@ __all__ = [
     "upsert_routing_rule",
     "insert_agent_metric",
     "insert_council_decision",
+    "insert_lifecycle_transition",
 ]
 
 # ── SQLite helpers ────────────────────────────────────────────────────────────
@@ -121,6 +122,7 @@ CREATE TABLE IF NOT EXISTS bundler_registry (
     active            INTEGER DEFAULT 1,
     fallback_policy   TEXT DEFAULT 'ESCALATE',
     supported_chains  TEXT,
+    webhook_url       TEXT,
     registered_at     TEXT
 );
 
@@ -147,8 +149,15 @@ CREATE TABLE IF NOT EXISTS user_operations (
 CREATE TABLE IF NOT EXISTS attestation_log (
     user_op_hash       TEXT PRIMARY KEY,
     attestation_nonce  TEXT NOT NULL,
+    nonce              TEXT,
+    decision           TEXT,
+    risk_score         REAL,
+    trace_hash         TEXT,
+    bundler_id         TEXT,
     redeemed           INTEGER DEFAULT 0,
-    expires_at         INTEGER NOT NULL
+    expires_at         INTEGER,
+    expires_at_block   INTEGER NOT NULL DEFAULT 0,
+    created_at         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS lifecycle_transitions (
@@ -169,12 +178,58 @@ CREATE TABLE IF NOT EXISTS known_contracts (
     verified_at        TEXT
 );
 
+CREATE TABLE IF NOT EXISTS open_positions (
+    position_id TEXT PRIMARY KEY,
+    agent_addr TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    position_type TEXT NOT NULL,
+    asset TEXT NOT NULL,
+    amount_wei TEXT NOT NULL,
+    usd_value_at_entry REAL,
+    current_usd_value REAL,
+    health_factor REAL,
+    liquidation_threshold REAL,
+    chain_id INTEGER NOT NULL,
+    block_entered INTEGER,
+    last_updated_block INTEGER,
+    last_updated_ts INTEGER,
+    is_finalized INTEGER DEFAULT 0,
+    is_closed INTEGER DEFAULT 0,
+    closed_ts INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS recovery_alerts (
+    alert_id TEXT PRIMARY KEY,
+    agent_addr TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    triggered_by_trace TEXT,
+    pause_timestamp INTEGER,
+    classifications_json TEXT,
+    total_usd_at_risk REAL,
+    critical_count INTEGER DEFAULT 0,
+    warning_count INTEGER DEFAULT 0,
+    safe_count INTEGER DEFAULT 0,
+    webhook_delivered INTEGER DEFAULT 0,
+    webhook_ts INTEGER,
+    created_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS rate_limit_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id TEXT NOT NULL,
+    ts REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_org    ON events(org_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_agent  ON events(agent_addr, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_agent_org_ts ON events(agent_addr, org_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_org    ON traces(org_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_hash   ON traces(trace_hash);
 CREATE INDEX IF NOT EXISTS idx_policies_org  ON policies(org_id, agent_addr);
 CREATE INDEX IF NOT EXISTS idx_userops_sender_nonce ON user_operations(sender, nonce_key);
+CREATE INDEX IF NOT EXISTS idx_positions_agent_org ON open_positions(agent_addr, org_id, is_closed);
+CREATE INDEX IF NOT EXISTS idx_rate_limit_org_ts ON rate_limit_windows(org_id, ts);
 """
 
 
@@ -201,7 +256,44 @@ def init_sqlite() -> None:
     _ensure_dir(s.SQLITE_PATH)
     with sqlite3.connect(s.SQLITE_PATH) as conn:
         conn.executescript(_SQLITE_SCHEMA)
+        _apply_sqlite_migrations(conn)
         _seed_routing_rules(conn)
+
+
+def _has_column(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return any(r[1] == column_name for r in rows)
+
+
+def _apply_sqlite_migrations(conn: sqlite3.Connection) -> None:
+    """Apply additive schema migrations to existing local databases."""
+    migrations: list[tuple[str, str, str]] = [
+        ("agents", "agent_profile", "TEXT DEFAULT 'generic'"),
+        ("lifecycle_transitions", "capital_at_risk_usd", "REAL"),
+        ("open_positions", "is_finalized", "INTEGER DEFAULT 0"),
+        ("bundler_registry", "active", "INTEGER DEFAULT 1"),
+        ("bundler_registry", "supported_chains", "TEXT"),
+        ("bundler_registry", "webhook_url", "TEXT"),
+        ("bundler_registry", "registered_at", "TEXT"),
+        ("attestation_log", "nonce", "TEXT"),
+        ("attestation_log", "decision", "TEXT"),
+        ("attestation_log", "risk_score", "REAL"),
+        ("attestation_log", "trace_hash", "TEXT"),
+        ("attestation_log", "bundler_id", "TEXT"),
+        ("attestation_log", "expires_at", "INTEGER"),
+        ("attestation_log", "expires_at_block", "INTEGER NOT NULL DEFAULT 0"),
+        ("attestation_log", "created_at", "TEXT"),
+    ]
+
+    for table_name, column_name, column_def in migrations:
+        if not _has_column(conn, table_name, column_name):
+            conn.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}"
+            )
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attestation_expires_block ON attestation_log(expires_at_block)"
+    )
 
 
 def _seed_routing_rules(conn: sqlite3.Connection) -> None:
@@ -351,6 +443,35 @@ def insert_trace(
             """,
             (flow_id, org_id, agent_addr, trace_hash, dag_json, flag_count, risk_score,
              council_action, datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def insert_lifecycle_transition(
+    agent_addr: str,
+    org_id: str,
+    from_state: str,
+    to_state: str,
+    reason: str = "",
+    capital_at_risk_usd: float | None = None,
+) -> None:
+    from datetime import datetime, timezone
+
+    with get_sqlite_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO lifecycle_transitions
+              (agent_addr, org_id, from_state, to_state, reason, capital_at_risk_usd, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                agent_addr,
+                org_id,
+                from_state,
+                to_state,
+                reason,
+                capital_at_risk_usd,
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
 
 

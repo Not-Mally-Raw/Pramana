@@ -145,6 +145,84 @@ class CouncilResult(BaseModel):
 
 # ─── Pramãna Flow State ───────────────────────────────────────────────────────
 
+# ─── Phase 3: Financial State and Recovery ────────────────────────────────────
+
+class PositionType(str, Enum):
+    """Types of DeFi positions an agent can hold."""
+    LENDING = "LENDING"
+    COLLATERAL = "COLLATERAL"
+    LP = "LP"
+    PERP = "PERP"
+    STAKING = "STAKING"
+    VAULT = "VAULT"
+
+class PositionRisk(str, Enum):
+    """Liquidation risk classification for a position."""
+    SAFE = "SAFE"
+    WARNING = "WARNING"
+    CRITICAL = "CRITICAL"
+
+class SuggestedAction(str, Enum):
+    """Recommended action for a position at risk."""
+    HOLD = "HOLD"
+    REDUCE = "REDUCE"
+    CLOSE = "CLOSE"
+    HEDGE = "HEDGE"
+
+class OpenPosition(BaseModel):
+    """A single open DeFi position held by an agent."""
+    position_id: str           # UUID generated at registration
+    agent_addr: str
+    org_id: str
+    protocol: str              # "aave_v3", "compound_v3", "morpho", "gmx", etc.
+    position_type: PositionType
+    asset: str                 # token address
+    amount_wei: int
+    usd_value_at_entry: float
+    current_usd_value: float
+    health_factor: Optional[float] = None  # None for non-lending positions
+    liquidation_threshold: Optional[float] = None
+    chain_id: int
+    block_entered: int
+    last_updated_block: int
+    last_updated_ts: int
+    is_finalized: bool = False
+
+class PositionClassification(BaseModel):
+    """Risk classification of a single position."""
+    position: OpenPosition
+    risk_level: PositionRisk
+    hours_to_liquidation: Optional[float] = None  # None if not liquidatable
+    suggested_action: SuggestedAction
+    reasoning: str
+
+class RecoveryAlert(BaseModel):
+    """Alert generated when an agent is paused with open positions."""
+    alert_id: str
+    agent_addr: str
+    org_id: str
+    triggered_by_trace: str    # trace_hash that triggered the PAUSE
+    pause_timestamp: int
+    classifications: list[PositionClassification]
+    total_usd_at_risk: float
+    critical_count: int
+    warning_count: int
+    safe_count: int
+    webhook_delivered: bool = False
+    webhook_ts: Optional[int] = None
+
+class FinancialSnapshot(BaseModel):
+    """Financial state snapshot for a paused agent."""
+    total_usd_exposure: float
+    positions: list[OpenPosition]
+    net_unrealized_pnl: float
+    liquidation_risk_score: float  # 0.0–1.0 composite
+    snapshot_block: int
+    snapshot_ts: int
+
+
+# ─── Pramãna Flow State ───────────────────────────────────────────────────────
+
 class PramanaState(BaseModel):
     """Type-safe state passed through the CrewAI Flow.
     All fields have defaults so the flow can start with just an event.
@@ -154,6 +232,7 @@ class PramanaState(BaseModel):
     flag_count:     int = 0
     risk_score:     float = 0.0        # 0.0–1.0
     action:         FlowAction = FlowAction.PASS
+    final_decision_reason: str = ""
     council_result: CouncilResult | None = None
     trace_dag_json: str = ""            # serialized adjacency list
     trace_hash:     str = ""            # SHA-256 hex
@@ -162,6 +241,8 @@ class PramanaState(BaseModel):
     agent_profile:  str = "generic"     # treasury_bot | keeper_bot | arb_bot | rebalancer | generic
     open_positions: list[dict] | None = None  # For Step 2: position recovery data
     agent_stake:    float = 0.0         # For Step 6: Sybil guard (ETH, Web3.from_wei)
+    financial_snapshot: Optional[FinancialSnapshot] = None  # Phase 3: Financial state
+    recovery_alert: Optional[RecoveryAlert] = None  # Phase 3: Recovery classification
 
 
 # ─── Trace ────────────────────────────────────────────────────────────────────
