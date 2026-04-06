@@ -55,14 +55,16 @@ class ResultsAnalyzer:
         return (paused_count / len(self.metrics)) * 100.0 if self.metrics else 0.0
 
     def compute_agent_statistics(self) -> dict:
-        stats = defaultdict(lambda: {
-            "event_count": 0,
-            "flag_count": 0,
-            "avg_risk": 0.0,
-            "max_risk": 0.0,
-            "pause_count": 0,
-            "council_actions": defaultdict(int),
-        })
+        stats = defaultdict(
+            lambda: {
+                "event_count": 0,
+                "flag_count": 0,
+                "avg_risk": 0.0,
+                "max_risk": 0.0,
+                "pause_count": 0,
+                "council_actions": defaultdict(int),
+            }
+        )
 
         for metric in self.metrics:
             agent = metric.get("agent_addr", "unknown")
@@ -80,7 +82,9 @@ class ResultsAnalyzer:
                     idx = self.metrics.index(metric)
                     if idx > 0:
                         prev_risk = float(self.metrics[idx - 1].get("risk_score", 0.0))
-                        stats[agent]["avg_risk"] = (stats[agent]["avg_risk"] * (idx) + risk) / (idx + 1)
+                        stats[agent]["avg_risk"] = (
+                            stats[agent]["avg_risk"] * (idx) + risk
+                        ) / (idx + 1)
                 stats[agent]["max_risk"] = max(stats[agent]["max_risk"], risk)
                 if risk >= self.risk_score_pause_threshold:
                     stats[agent]["pause_count"] += 1
@@ -100,7 +104,8 @@ class ResultsAnalyzer:
 
         total_events = len(self.metrics)
         paused_events = sum(
-            1 for m in self.metrics
+            1
+            for m in self.metrics
             if float(m.get("risk_score", 0.0)) >= self.risk_score_pause_threshold
         )
 
@@ -127,19 +132,25 @@ class ResultsAnalyzer:
             f.write(f"-" * 80 + "\n")
             f.write(f"Total Events Processed: {summary['total_events']}\n")
             f.write(f"Events Paused by Guard: {summary['paused_by_guard']}\n")
-            f.write(f"Guard Pause Percentage: {summary['guard_pause_percentage']:.2f}%\n")
-            f.write(f"Pause Threshold (Risk Score): {summary['high_risk_threshold']}\n\n")
+            f.write(
+                f"Guard Pause Percentage: {summary['guard_pause_percentage']:.2f}%\n"
+            )
+            f.write(
+                f"Pause Threshold (Risk Score): {summary['high_risk_threshold']}\n\n"
+            )
 
             f.write(f"AGENT-LEVEL STATISTICS\n")
             f.write(f"-" * 80 + "\n")
             for agent_addr, stats in sorted(agent_stats.items()):
                 f.write(f"\n{agent_addr}:\n")
                 f.write(f"  Events: {stats['event_count']}\n")
-                f.write(f"  Flags: {stats['flag_count']} ({(stats['flag_count']/max(stats['event_count'],1)*100):.1f}%)\n")
+                f.write(
+                    f"  Flags: {stats['flag_count']} ({(stats['flag_count']/max(stats['event_count'],1)*100):.1f}%)\n"
+                )
                 f.write(f"  Avg Risk Score: {stats['avg_risk']:.3f}\n")
                 f.write(f"  Max Risk Score: {stats['max_risk']:.3f}\n")
                 f.write(f"  Paused Events: {stats['pause_count']}\n")
-                if stats['council_actions']:
+                if stats["council_actions"]:
                     f.write(f"  Council Decisions: {dict(stats['council_actions'])}\n")
 
             f.write(f"\n{'=' * 80}\n")
@@ -170,16 +181,24 @@ class ResultsAnalyzer:
 
             f.write(f"Realistic Agents (Expected No Flags):\n")
             f.write(f"  Total Flags: {realistic_flags}\n")
-            f.write(f"  Status: {'PASS' if realistic_flags < 5 else 'FAIL'} (target: <5 false positives)\n\n")
+            f.write(
+                f"  Status: {'PASS' if realistic_flags < 5 else 'FAIL'} (target: <5 false positives)\n\n"
+            )
 
             f.write(f"Adversarial Agents (Expected Flags):\n")
             f.write(f"  Total Flags: {adversarial_flags}\n")
-            f.write(f"  Status: {'PASS' if adversarial_flags > 20 else 'FAIL'} (target: >20 detections)\n\n")
+            f.write(
+                f"  Status: {'PASS' if adversarial_flags > 20 else 'FAIL'} (target: >20 detections)\n\n"
+            )
 
             f.write(f"Overall Guard Effectiveness:\n")
             f.write(f"  Pause Rate: {summary['guard_pause_percentage']:.2f}%\n")
-            f.write(f"  Status: {'PASS' if 5 <= summary['guard_pause_percentage'] <= 40 else 'FAIL'}\n")
-            f.write(f"  (target: 5-40% pause rate, avoiding false positive lock-in)\n\n")
+            f.write(
+                f"  Status: {'PASS' if 5 <= summary['guard_pause_percentage'] <= 40 else 'FAIL'}\n"
+            )
+            f.write(
+                f"  (target: 5-40% pause rate, avoiding false positive lock-in)\n\n"
+            )
 
         print(f"Report written to {output_path}")
         print(f"Guard Pause Percentage: {summary['guard_pause_percentage']:.2f}%")

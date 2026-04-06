@@ -3,6 +3,7 @@ core/agents/validator.py — Schema + dry-run transaction validator L1 agent.
 Pass 1: JSON schema validation of action/calldata. <50ms.
 Pass 2 (borderline): eth_call dry-run on Anvil (simulation, no state change).
 """
+
 from __future__ import annotations
 
 import json
@@ -49,17 +50,18 @@ class ValidatorAgent(BaseL1Agent):
         score = 0.0
 
         from core.parsers.calldata import decode_all_calls
+
         parsed_payload = self._parse_calldata(event.calldata or "")
         meta["payload_parsed"] = isinstance(parsed_payload, dict)
-        
+
         # ── ABI Calldata Parsing ──────────────────────────────────────────
         calls = decode_all_calls(event.calldata or "")
         meta["decoded_calls_count"] = len(calls)
-        
+
         if calls:
             meta["primary_protocol"] = calls[0].protocol
             meta["primary_action"] = calls[0].name
-            
+
             # Check for explicitly risky selectors
             for c in calls:
                 if c.risk == "critical":
@@ -78,7 +80,11 @@ class ValidatorAgent(BaseL1Agent):
         normalized_action = (event.action or "").lower()
         schema = _SCHEMAS.get(normalized_action)
         if isinstance(parsed_payload, dict) and schema:
-            missing = [field for field in schema.get("required", []) if field not in parsed_payload]
+            missing = [
+                field
+                for field in schema.get("required", [])
+                if field not in parsed_payload
+            ]
             if missing:
                 issues.append(f"missing required fields: {', '.join(missing)}")
                 score = max(score, 0.85)
@@ -104,9 +110,19 @@ class ValidatorAgent(BaseL1Agent):
             for key, value in parsed_payload.items():
                 if not isinstance(value, str):
                     continue
-                if key.lower() in {"to", "from", "spender", "token", "token_in", "token_out", "recipient", "receiver", "owner"}:
+                if key.lower() in {
+                    "to",
+                    "from",
+                    "spender",
+                    "token",
+                    "token_in",
+                    "token_out",
+                    "recipient",
+                    "receiver",
+                    "owner",
+                }:
                     all_addresses.add(value)
-            
+
         invalid_addrs = [a for a in all_addresses if not self._is_valid_address(a)]
         if invalid_addrs:
             issues.append(f"invalid addresses found in calldata: {len(invalid_addrs)}")
@@ -124,7 +140,9 @@ class ValidatorAgent(BaseL1Agent):
         reason = "; ".join(issues) if issues else "validation passed"
         return self._make_result(self.name, flagged, score, reason, meta)
 
-    def verify(self, event: ChainEvent, state: PramanaState, first: L1Result) -> L1Result:
+    def verify(
+        self, event: ChainEvent, state: PramanaState, first: L1Result
+    ) -> L1Result:
         """Second pass: eth_call dry-run simulation on Anvil."""
         meta = dict(first.metadata)
         s = get_settings()
@@ -134,12 +152,20 @@ class ValidatorAgent(BaseL1Agent):
 
         if not sim_ok:
             return self._make_result(
-                self.name, True, min(first.score + 0.20, 1.0),
-                first.reason + f" (sim failed: {sim_error[:60]})", meta, pass_count=2
+                self.name,
+                True,
+                min(first.score + 0.20, 1.0),
+                first.reason + f" (sim failed: {sim_error[:60]})",
+                meta,
+                pass_count=2,
             )
         return self._make_result(
-            self.name, first.flagged, max(first.score - 0.10, 0.0),
-            first.reason + " (simulation passed)", meta, pass_count=2
+            self.name,
+            first.flagged,
+            max(first.score - 0.10, 0.0),
+            first.reason + " (simulation passed)",
+            meta,
+            pass_count=2,
         )
 
     # ── Internals ─────────────────────────────────────────────────────────────
@@ -155,6 +181,7 @@ class ValidatorAgent(BaseL1Agent):
             pass
         if calldata.startswith("0x"):
             from core.parsers.calldata import _safe_hex_bytes
+
             try:
                 raw = _safe_hex_bytes(calldata[2:])
                 if not raw:
@@ -168,6 +195,7 @@ class ValidatorAgent(BaseL1Agent):
     @staticmethod
     def _is_valid_address(addr: str) -> bool:
         import re
+
         return bool(re.match(r"^0x[0-9a-fA-F]{40}$", str(addr)))
 
     @staticmethod
@@ -179,9 +207,21 @@ class ValidatorAgent(BaseL1Agent):
                 "method": "eth_call",
                 "params": [
                     {
-                        "from": event.agent_id if event.agent_id.startswith("0x") else "0x0000000000000000000000000000000000000001",
-                        "to":   event.agent_id if event.agent_id.startswith("0x") else "0x0000000000000000000000000000000000000001",
-                        "data": event.calldata if event.calldata and event.calldata.startswith("0x") else "0x",
+                        "from": (
+                            event.agent_id
+                            if event.agent_id.startswith("0x")
+                            else "0x0000000000000000000000000000000000000001"
+                        ),
+                        "to": (
+                            event.agent_id
+                            if event.agent_id.startswith("0x")
+                            else "0x0000000000000000000000000000000000000001"
+                        ),
+                        "data": (
+                            event.calldata
+                            if event.calldata and event.calldata.startswith("0x")
+                            else "0x"
+                        ),
                         "value": hex(event.value_wei) if event.value_wei else "0x0",
                     },
                     "latest",

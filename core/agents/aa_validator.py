@@ -2,28 +2,30 @@
 core/agents/aa_validator.py — L1 Agent for Account Abstraction validation.
 Runs structured, heuristic checks on intercepted ERC-4337 UserOperations.
 """
+
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from core.agents.base import BaseL1Agent
+from core.config.settings import get_settings
 from core.db import get_sqlite_conn
 from core.parsers.calldata import CalldataParser
-from core.config.settings import get_settings
 from utils.models import ChainEvent, L1Result, PramanaState
-import time
 
 logger = logging.getLogger("pramana.aa_validator")
 
 # In-memory TTL cache for paymaster node queries to maintain <500ms p95
-_paymaster_deposit_cache = {} # Dict[str, Tuple[uint112, float(auth_time)]]
+_paymaster_deposit_cache = {}  # Dict[str, Tuple[uint112, float(auth_time)]]
 
 # The canonical ERC-4337 v0.6 and v0.7 EntryPoint addresses
 CANONICAL_ENTRY_POINTS = {
-    "0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789", # v0.6
-    "0x0000000071727De22E5E9d8BAf0edAc6f37da032", # v0.7
+    "0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789",  # v0.6
+    "0x0000000071727De22E5E9d8BAf0edAc6f37da032",  # v0.7
 }
+
 
 class AAValidatorAgent(BaseL1Agent):
     name = "aa_validator"
@@ -45,7 +47,11 @@ class AAValidatorAgent(BaseL1Agent):
         # Although UserOp doesn't explicitly declare EntryPoint inside the op (it's in the bundler call),
         # we can pass it via request context or default to assuming canonical for this check unless we trace it.
         # But actually, the EntryPoint is an argument to handleOps. We check it against the registry if we have it in state.
-        ep_address = state.event.metadata.get("entry_point") if getattr(state.event, "metadata", None) else None
+        ep_address = (
+            state.event.metadata.get("entry_point")
+            if getattr(state.event, "metadata", None)
+            else None
+        )
         if ep_address and ep_address not in CANONICAL_ENTRY_POINTS:
             flags.append(f"non-canonical entry point {ep_address}")
             max_score = max(max_score, 0.90)  # High risk
@@ -56,15 +62,40 @@ class AAValidatorAgent(BaseL1Agent):
         if depth > 8:
             flags.append(f"excessive call depth ({depth})")
             max_score = max(max_score, 0.75)
-            
+
+        # 2.c Batch intent firewall: sum ETH value across batched calls
+        # (AA drains often hide value inside account.executeBatch callData)
+        profile = state.agent_profile or "generic"
+        thresholds = s.AGENT_PROFILE_THRESHOLDS.get(
+            profile, s.AGENT_PROFILE_THRESHOLDS["generic"]
+        )
+        intended_value_wei, decode_ok = self._sum_intended_eth_value_wei(uop.callData)
+        meta["intent_value_decoded"] = decode_ok
+        meta["intent_value_wei"] = int(intended_value_wei)
+        meta["intent_value_eth"] = round(float(intended_value_wei) / 1e18, 8)
+        meta["intent_value_threshold_eth"] = float(
+            thresholds.get("BALANCE_DRAIN_PCT", s.BALANCE_DRAIN_PCT)
+        )
+
+        if decode_ok:
+            threshold_eth = float(meta["intent_value_threshold_eth"])
+            intended_eth = float(meta["intent_value_eth"])
+            if intended_eth > threshold_eth:
+                flags.append(
+                    f"batch value intent {intended_eth:.4f} ETH > {threshold_eth:.4f} ETH"
+                )
+                max_score = max(max_score, 0.82)
+
         # 2.b check_contract_age() for new targeted addresses
         unverified_targets = self._check_targeted_contract_age(targets)
         if unverified_targets:
-            flags.append(f"interacting with unknown/recent contracts: {','.join(unverified_targets[:3])}")
+            flags.append(
+                f"interacting with unknown/recent contracts: {','.join(unverified_targets[:3])}"
+            )
             max_score = max(max_score, 0.65)
 
         # 3. check_nonce_lane_parallelism()
-        profile = state.agent_profile or "generic"
+        # Use the same profile label for remaining checks.
         lane_limit = self._get_lane_limit(profile)
         parallel_count = self._check_nonce_lane_parallelism(uop.sender, uop.nonce_key)
         meta["parallel_nonces"] = parallel_count
@@ -82,16 +113,17 @@ class AAValidatorAgent(BaseL1Agent):
             max_score = max(max_score, 0.80)
 
         # 5. check_paymaster_solvency(): Requires node state access
-        # For pre-inclusion safety without RPC lag, we verify we have the fields. 
+        # For pre-inclusion safety without RPC lag, we verify we have the fields.
         # Actual on-chain getDepositInfo() is deferred to L1 verify() to maintain check() <50ms.
-        
+
         flagged = len(flags) > 0
         reason = " | ".join(flags) if flagged else "AA structurally sound"
-        
+
         return self._make_result(self.name, flagged, max_score, reason, meta)
 
-
-    def verify(self, event: ChainEvent, state: PramanaState, first: L1Result) -> L1Result:
+    def verify(
+        self, event: ChainEvent, state: PramanaState, first: L1Result
+    ) -> L1Result:
         # Check actual on-chain paymaster solvency or sender deposit
         uop = event.user_operation
         if not uop:
@@ -110,20 +142,74 @@ class AAValidatorAgent(BaseL1Agent):
 
         try:
             from web3 import Web3
+
             # We connect to an active RPC via the config
             w3 = Web3(Web3.HTTPProvider(s.ANVIL_RPC)) if "anvil" in s.NETWORK else None
 
             if w3 and w3.is_connected():
                 ep_contract = w3.eth.contract(
                     address=Web3.to_checksum_address(list(CANONICAL_ENTRY_POINTS)[0]),
-                    abi=[{"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"getDepositInfo","outputs":[{"components":[{"internalType":"uint112","name":"deposit","type":"uint112"},{"internalType":"bool","name":"staked","type":"bool"},{"internalType":"uint112","name":"stake","type":"uint112"},{"internalType":"uint32","name":"unstakeDelaySec","type":"uint32"},{"internalType":"uint48","name":"withdrawTime","type":"uint48"}],"internalType":"struct IEntryPoint.DepositInfo","name":"info","type":"tuple"}],"stateMutability":"view","type":"function"}]
+                    abi=[
+                        {
+                            "inputs": [
+                                {
+                                    "internalType": "address",
+                                    "name": "account",
+                                    "type": "address",
+                                }
+                            ],
+                            "name": "getDepositInfo",
+                            "outputs": [
+                                {
+                                    "components": [
+                                        {
+                                            "internalType": "uint112",
+                                            "name": "deposit",
+                                            "type": "uint112",
+                                        },
+                                        {
+                                            "internalType": "bool",
+                                            "name": "staked",
+                                            "type": "bool",
+                                        },
+                                        {
+                                            "internalType": "uint112",
+                                            "name": "stake",
+                                            "type": "uint112",
+                                        },
+                                        {
+                                            "internalType": "uint32",
+                                            "name": "unstakeDelaySec",
+                                            "type": "uint32",
+                                        },
+                                        {
+                                            "internalType": "uint48",
+                                            "name": "withdrawTime",
+                                            "type": "uint48",
+                                        },
+                                    ],
+                                    "internalType": "struct IEntryPoint.DepositInfo",
+                                    "name": "info",
+                                    "type": "tuple",
+                                }
+                            ],
+                            "stateMutability": "view",
+                            "type": "function",
+                        }
+                    ],
                 )
-                
-                total_required_wei = (uop.callGasLimit + uop.verificationGasLimit + uop.preVerificationGas) * uop.maxFeePerGas
-                
+
+                total_required_wei = (
+                    uop.callGasLimit + uop.verificationGasLimit + uop.preVerificationGas
+                ) * uop.maxFeePerGas
+
                 has_paymaster = bool(uop.paymaster) or bool(uop.paymasterAndData)
-                target = uop.paymaster or (uop.paymasterAndData[:42] if uop.paymasterAndData and len(uop.paymasterAndData) >= 42 else None)
-                
+                target = uop.paymaster or (
+                    uop.paymasterAndData[:42]
+                    if uop.paymasterAndData and len(uop.paymasterAndData) >= 42
+                    else None
+                )
+
                 if not target:
                     # Self-paying account
                     target = uop.sender
@@ -132,18 +218,22 @@ class AAValidatorAgent(BaseL1Agent):
                 cache_hit = _paymaster_deposit_cache.get(target)
                 now = time.time()
                 deposit = 0
-                
+
                 if cache_hit and now - cache_hit[1] < 60:
                     deposit = cache_hit[0]
                 else:
-                    info = ep_contract.functions.getDepositInfo(Web3.to_checksum_address(target)).call()
-                    deposit = info[0] # deposit is uint112
+                    info = ep_contract.functions.getDepositInfo(
+                        Web3.to_checksum_address(target)
+                    ).call()
+                    deposit = info[0]  # deposit is uint112
                     _paymaster_deposit_cache[target] = (deposit, now)
-                    
+
                 meta["sponsor_deposit_wei"] = deposit
-                
+
                 if deposit < total_required_wei:
-                    flags.append(f"undercollateralized {'paymaster' if has_paymaster else 'sender'} (deposit {deposit} < required {total_required_wei})")
+                    flags.append(
+                        f"undercollateralized {'paymaster' if has_paymaster else 'sender'} (deposit {deposit} < required {total_required_wei})"
+                    )
                     max_score = max(max_score, 0.85)
 
         except Exception as e:
@@ -151,10 +241,13 @@ class AAValidatorAgent(BaseL1Agent):
 
         if flags:
             reason = " | ".join(flags)
-            return self._make_result(self.name, True, max_score, reason, meta, pass_count=2)
+            return self._make_result(
+                self.name, True, max_score, reason, meta, pass_count=2
+            )
 
-        return self._make_result(self.name, first.flagged, max_score, first.reason, meta, pass_count=2)
-
+        return self._make_result(
+            self.name, first.flagged, max_score, first.reason, meta, pass_count=2
+        )
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
@@ -166,7 +259,7 @@ class AAValidatorAgent(BaseL1Agent):
             parser = CalldataParser()
             calls = parser.decode_batch_calls(calldata)
             targets = []
-            
+
             # Find the deepest nested level
             def get_depth(batch_calls):
                 if not batch_calls:
@@ -180,7 +273,7 @@ class AAValidatorAgent(BaseL1Agent):
                         targets.append(c.parameters["target"])
                     if "to" in getattr(c, "parameters", {}):
                         targets.append(c.parameters["to"])
-                        
+
                     if "calls" in getattr(c, "parameters", {}):
                         # Recursive unwrapping not strictly returned by parser as tree,
                         # but we can count total calls as a proxy for complexity depth
@@ -192,6 +285,55 @@ class AAValidatorAgent(BaseL1Agent):
         except Exception:
             return 1, []
 
+    def _sum_intended_eth_value_wei(self, calldata: str) -> tuple[int, bool]:
+        """Best-effort extraction of intended ETH value from AA account executions.
+
+        Supports common ERC-4337 smart accounts:
+        - SimpleAccount execute(dest,value,func)
+        - LightAccount executeBatch(dest[],value[],func[])
+        - Kernel executeBatch((to,value,data)[])
+
+        Returns (total_value_wei, decode_ok).
+        """
+        if not calldata or calldata == "0x":
+            return 0, True
+        try:
+            parser = CalldataParser()
+            top = parser.decode(calldata)
+            if not top:
+                return 0, False
+
+            total = 0
+
+            # Common: top-level `value` param (int or uint256[])
+            value_field = top.params.get("value") if hasattr(top, "params") else None
+            if isinstance(value_field, list):
+                for v in value_field:
+                    try:
+                        total += int(v or 0)
+                    except (TypeError, ValueError):
+                        continue
+            elif value_field is not None:
+                try:
+                    total += int(value_field)
+                except (TypeError, ValueError):
+                    pass
+
+            # Kernel batch: `calls` is (to,value,data)[]
+            calls_field = top.params.get("calls") if hasattr(top, "params") else None
+            if isinstance(calls_field, list):
+                for item in calls_field:
+                    if not isinstance(item, (list, tuple)) or len(item) < 2:
+                        continue
+                    try:
+                        total += int(item[1] or 0)
+                    except (TypeError, ValueError):
+                        continue
+
+            return max(total, 0), True
+        except Exception:
+            return 0, False
+
     def _check_targeted_contract_age(self, targets: list[str]) -> list[str]:
         """Flags targeted addresses if they aren't in the known_contracts 30-day safe list."""
         unverified = []
@@ -202,17 +344,21 @@ class AAValidatorAgent(BaseL1Agent):
                 for target in targets:
                     if not target or not isinstance(target, str):
                         continue
-                    row = conn.execute("SELECT 1 FROM known_contracts WHERE lower(address)=?", (target.lower(),)).fetchone()
+                    row = conn.execute(
+                        "SELECT 1 FROM known_contracts WHERE lower(address)=?",
+                        (target.lower(),),
+                    ).fetchone()
                     if not row:
                         unverified.append(target)
             return unverified
         except Exception:
             return []
 
-
     def _get_lane_limit(self, profile: str) -> int:
         s = get_settings()
-        thresholds = s.AGENT_PROFILE_THRESHOLDS.get(profile, s.AGENT_PROFILE_THRESHOLDS["generic"])
+        thresholds = s.AGENT_PROFILE_THRESHOLDS.get(
+            profile, s.AGENT_PROFILE_THRESHOLDS["generic"]
+        )
         # arb_bots can do 10 parallel ops. Treasuries only 1.
         if profile == "arb_bot":
             return 10
@@ -222,43 +368,44 @@ class AAValidatorAgent(BaseL1Agent):
             return 1
         return thresholds.get("ACTION_LOOP_PER_MIN", 5) // 2
 
-
     def _check_nonce_lane_parallelism(self, sender: str, nonce_key: int) -> int:
         """Counts how many recent UserOps used this exact nonce_key for this sender."""
         try:
             with get_sqlite_conn() as conn:
                 row = conn.execute(
                     "SELECT COUNT(*) FROM user_operations WHERE sender=? AND nonce_key=? AND created_at > datetime('now','-1 hour')",
-                    (sender, nonce_key)
+                    (sender, nonce_key),
                 ).fetchone()
                 return row["COUNT(*)"] if row else 0
         except Exception:
             return 0
 
-
-    def _check_gas_budget_inflation(self, sender: str, current_total_gas: int, profile: str) -> float:
+    def _check_gas_budget_inflation(
+        self, sender: str, current_total_gas: int, profile: str
+    ) -> float:
         """Returns the ratio of current gas vs the agent's historical median."""
         try:
             with get_sqlite_conn() as conn:
-                # Get median gas. SQLite doesn't have MEDIAN natively, so we approximate with AVG 
+                # Get median gas. SQLite doesn't have MEDIAN natively, so we approximate with AVG
                 # or LIMIT/OFFSET for exact median. Here we use AVG of the last 100 UserOps.
                 row = conn.execute(
                     "SELECT AVG(call_gas_limit + verification_gas_limit + pre_verification_gas) as avg_gas "
                     "FROM (SELECT call_gas_limit, verification_gas_limit, pre_verification_gas FROM user_operations "
                     "WHERE sender=? ORDER BY created_at DESC LIMIT 100)",
-                    (sender,)
+                    (sender,),
                 ).fetchone()
-                
+
                 avg_gas = row["avg_gas"] if row and row["avg_gas"] else None
-                
+
                 if avg_gas and avg_gas > 0:
                     return current_total_gas / avg_gas
-                    
+
             # Fallback to defaults
             s = get_settings()
-            thresholds = s.AGENT_PROFILE_THRESHOLDS.get(profile, s.AGENT_PROFILE_THRESHOLDS["generic"])
+            thresholds = s.AGENT_PROFILE_THRESHOLDS.get(
+                profile, s.AGENT_PROFILE_THRESHOLDS["generic"]
+            )
             default_gas = thresholds.get("DEFAULT_GAS_BUDGET", 200000)
             return current_total_gas / max(default_gas, 1)
         except Exception:
             return 1.0
-

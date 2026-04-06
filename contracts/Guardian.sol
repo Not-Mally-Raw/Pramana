@@ -143,10 +143,12 @@ contract Guardian {
     mapping(bytes32 => mapping(address => bool)) public pauseVotes;
     mapping(bytes32 => uint256) public pauseVoteCount;
     mapping(bytes32 => bool) public pauseExecuted;
+    mapping(bytes32 => bytes32) public pauseRefToTrace;
 
     event PauseRequested(bytes32 indexed pauseId, address indexed agent, string reason);
     event PauseVoteCast(bytes32 indexed pauseId, address indexed voter, uint256 voteCount);
     event PauseExecuted(bytes32 indexed pauseId, address indexed agent);
+    event TraceLinked(bytes32 indexed pauseRef, bytes32 indexed traceHash);
 
     /// @notice Request a pause on an agent with multisig consensus.
     /// Emergency (score >= 0.95): 1-of-5. Standard (score 0.80-0.95): 2-of-5.
@@ -172,6 +174,15 @@ contract Guardian {
             emit PauseExecuted(pauseId, agent);
         }
         return pauseId;
+    }
+
+    /// @notice Link finalized trace hash to the pre-finalization pause reference.
+    /// @dev Uses admin role because pause requests are also currently admin-submitted.
+    function linkTrace(bytes32 pauseRef, bytes32 traceHash) external onlyAdmin {
+        require(pauseRef != bytes32(0), "Guardian: invalid pause ref");
+        require(traceHash != bytes32(0), "Guardian: invalid trace hash");
+        pauseRefToTrace[pauseRef] = traceHash;
+        emit TraceLinked(pauseRef, traceHash);
     }
 
     // ─── Views ────────────────────────────────────────────────────────────────

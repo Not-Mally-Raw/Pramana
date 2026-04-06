@@ -1,15 +1,11 @@
 import argparse
-import sys
 import json
+import sys
 
 import requests
 
-from scripts.testnet_config import (
-    TEST_AGENTS,
-    PRAMANA_API_URL,
-    PRAMANA_ORG_ID,
-)
 from scripts.agent_fixtures import get_agent_behavior
+from scripts.testnet_config import PRAMANA_API_URL, PRAMANA_ORG_ID, TEST_AGENTS
 
 
 def register_agent(api_url: str, agent_addr: str, org_id: str, network: str) -> bool:
@@ -23,6 +19,13 @@ def register_agent(api_url: str, agent_addr: str, org_id: str, network: str) -> 
     }
 
     try:
+        import jwt
+
+        from core.config.settings import get_settings
+
+        s = get_settings()
+        token = jwt.encode({"org_id": org_id}, s.JWT_SECRET, algorithm="HS256")
+
         resp = requests.post(
             f"{api_url}/agents/register",
             json={
@@ -30,8 +33,8 @@ def register_agent(api_url: str, agent_addr: str, org_id: str, network: str) -> 
                 "did": f"did:pramana:{agent_addr}",
                 "metadata": metadata,
             },
-            headers={"X-Org-Id": org_id},
-            timeout=10
+            headers={"X-Org-Id": org_id, "Authorization": f"Bearer {token}"},
+            timeout=10,
         )
         return resp.status_code in (200, 201)
     except Exception as e:
@@ -41,10 +44,17 @@ def register_agent(api_url: str, agent_addr: str, org_id: str, network: str) -> 
 
 def list_agents(api_url: str, org_id: str) -> list:
     try:
+        import jwt
+
+        from core.config.settings import get_settings
+
+        s = get_settings()
+        token = jwt.encode({"org_id": org_id}, s.JWT_SECRET, algorithm="HS256")
+
         resp = requests.get(
             f"{api_url}/agents",
-            headers={"X-Org-Id": org_id},
-            timeout=10
+            headers={"X-Org-Id": org_id, "Authorization": f"Bearer {token}"},
+            timeout=10,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -62,8 +72,10 @@ def main():
     parser.add_argument("--count", type=int, default=10)
     args = parser.parse_args()
 
-    agents_to_register = TEST_AGENTS[:args.count]
-    print(f"Registering {len(agents_to_register)} agents with org_id={args.org} network={args.network}")
+    agents_to_register = TEST_AGENTS[: args.count]
+    print(
+        f"Registering {len(agents_to_register)} agents with org_id={args.org} network={args.network}"
+    )
 
     success_count = 0
     for i, agent_addr in enumerate(agents_to_register):
@@ -78,7 +90,9 @@ def main():
     registered = list_agents(args.api_url, args.org)
     print(f"Verification: {len(registered)} agents in org {args.org}")
     for agent in registered[:3]:
-        print(f"  - {agent.get('agent_addr')} (reputation={agent.get('reputation', 0):.2f})")
+        print(
+            f"  - {agent.get('agent_addr')} (reputation={agent.get('reputation', 0):.2f})"
+        )
 
     return 0 if success_count == len(agents_to_register) else 1
 

@@ -3,6 +3,7 @@ core/agents/base.py — BaseL1Agent abstract class.
 Two-pass template method: check() (first pass) → verify() (borderline second pass).
 All L1 agents extend this.
 """
+
 from __future__ import annotations
 
 import time
@@ -14,7 +15,7 @@ from utils.models import ChainEvent, L1Result, PramanaState
 __all__ = ["BaseL1Agent"]
 
 # Borderline band: re-check if score is in [low, high]
-BORDERLINE_LOW  = 0.60
+BORDERLINE_LOW = 0.60
 BORDERLINE_HIGH = 0.80
 
 
@@ -36,7 +37,9 @@ class BaseL1Agent(ABC):
     def check(self, event: ChainEvent, state: PramanaState) -> L1Result:
         """First-pass check. Must run in < max_latency_ms."""
 
-    def verify(self, event: ChainEvent, state: PramanaState, first: L1Result) -> L1Result:
+    def verify(
+        self, event: ChainEvent, state: PramanaState, first: L1Result
+    ) -> L1Result:
         """
         Optional second-pass verification when score is borderline.
         Default: return first result unchanged.
@@ -55,6 +58,7 @@ class BaseL1Agent(ABC):
         degraded results to escalation, not pass.
         """
         import logging
+
         logger = logging.getLogger(f"pramana.agent.{self.name}")
 
         t0 = time.perf_counter()

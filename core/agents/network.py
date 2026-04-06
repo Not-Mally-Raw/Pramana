@@ -4,6 +4,7 @@ Checks: gas spike (>2x avg), tx latency >500ms, Anvil node reachability.
 Pass 1: compare gas to rolling average via DuckDB. ~15ms target.
 Pass 2 (borderline): eth_call to Anvil to verify connectivity + recheck.
 """
+
 from __future__ import annotations
 
 import time
@@ -17,7 +18,7 @@ from utils.models import ChainEvent, L1Result, PramanaState
 
 __all__ = ["NetworkAgent"]
 
-_GAS_HISTORY_WINDOW = 20   # last N txs for rolling average
+_GAS_HISTORY_WINDOW = 20  # last N txs for rolling average
 
 
 class NetworkAgent(BaseL1Agent):
@@ -36,7 +37,9 @@ class NetworkAgent(BaseL1Agent):
         # ── Gas spike detection (profile-aware) ─────────────────────────────
         # Fix 11: Load per-profile GAS_SPIKE_MULTIPLIER instead of static global
         profile = state.agent_profile or "generic"
-        thresholds = s.AGENT_PROFILE_THRESHOLDS.get(profile, s.AGENT_PROFILE_THRESHOLDS["generic"])
+        thresholds = s.AGENT_PROFILE_THRESHOLDS.get(
+            profile, s.AGENT_PROFILE_THRESHOLDS["generic"]
+        )
         gas_spike_mult = thresholds.get("GAS_SPIKE_MULTIPLIER", s.GAS_SPIKE_MULTIPLIER)
 
         avg_gas = self._get_avg_gas(event.agent_id, event.org_id)
@@ -46,7 +49,9 @@ class NetworkAgent(BaseL1Agent):
 
         if avg_gas > 0 and gas_gwei > avg_gas * gas_spike_mult:
             spike_ratio = gas_gwei / avg_gas
-            issues.append(f"gas spike {spike_ratio:.1f}x avg ({gas_gwei:.0f} vs {avg_gas:.0f} gwei)")
+            issues.append(
+                f"gas spike {spike_ratio:.1f}x avg ({gas_gwei:.0f} vs {avg_gas:.0f} gwei)"
+            )
             score = max(score, min(0.5 + (spike_ratio - 2.0) * 0.1, 1.0))
 
         # ── Transaction latency (simulated from timestamp delta) ────────────
@@ -66,19 +71,27 @@ class NetworkAgent(BaseL1Agent):
         reason = "; ".join(issues) if issues else "network nominal"
         return self._make_result(self.name, flagged, score, reason, meta)
 
-    def verify(self, event: ChainEvent, state: PramanaState, first: L1Result) -> L1Result:
+    def verify(
+        self, event: ChainEvent, state: PramanaState, first: L1Result
+    ) -> L1Result:
         """Second pass: retry node ping with larger timeout and recheck gas history."""
         s = get_settings()
         meta = dict(first.metadata)
         reachable = self._ping_node(s.active_rpc, timeout=3)
         meta["node_recheck"] = reachable
         if not reachable:
-            return self._make_result(self.name, True, 0.90, "node unreachable on recheck", meta, pass_count=2)
+            return self._make_result(
+                self.name, True, 0.90, "node unreachable on recheck", meta, pass_count=2
+            )
 
         # If node is up, trust first result but lower score slightly
         return self._make_result(
-            self.name, first.flagged, max(first.score - 0.10, 0.0),
-            first.reason + " (verified)", meta, pass_count=2
+            self.name,
+            first.flagged,
+            max(first.score - 0.10, 0.0),
+            first.reason + " (verified)",
+            meta,
+            pass_count=2,
         )
 
     # ── Internals ─────────────────────────────────────────────────────────────
@@ -93,6 +106,7 @@ class NetworkAgent(BaseL1Agent):
         """
         try:
             from core.db import get_duck_conn
+
             with get_duck_conn() as conn:
                 row = conn.execute(
                     """
@@ -114,7 +128,12 @@ class NetworkAgent(BaseL1Agent):
         try:
             resp = requests.post(
                 rpc_url,
-                json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "eth_blockNumber",
+                    "params": [],
+                    "id": 1,
+                },
                 timeout=timeout,
             )
             return resp.status_code == 200

@@ -3,6 +3,7 @@ core/agents/recovery.py — Recovery state machine executor (L2).
 Executes recovery_playbook.json steps sequentially.
 O(1) lookup by failure_type. No LLM.
 """
+
 from __future__ import annotations
 
 import json
@@ -79,7 +80,9 @@ class RecoveryAgent:
 
     # ── Step executors ────────────────────────────────────────────────────────
 
-    def _execute_step(self, step: RecoveryStep, state: PramanaState) -> tuple[bool, str]:
+    def _execute_step(
+        self, step: RecoveryStep, state: PramanaState
+    ) -> tuple[bool, str]:
         action = step.action
         params = step.params
 
@@ -93,6 +96,7 @@ class RecoveryAgent:
             elif action == "set_degraded_mode":
                 mode = params.get("mode", "NORMAL")
                 from utils.models import DegradedMode
+
                 state.degraded_mode = DegradedMode[mode]
                 return True, f"mode set to {mode}"
 
@@ -101,9 +105,11 @@ class RecoveryAgent:
                 url = params.get("url", "http://127.0.0.1:8545")
                 # Live RPC switch via settings override (not cached settings)
                 import os
+
                 os.environ["NETWORK"] = target
                 os.environ["ANVIL_RPC"] = url
                 from core.config.settings import invalidate_settings
+
                 invalidate_settings()
                 return True, f"switched to {target} @ {url}"
 
@@ -116,8 +122,10 @@ class RecoveryAgent:
                 return True, "retry_db: signal sent"
 
             elif action == "switch_db":
-                from core.config.settings import get_settings, invalidate_settings
                 import os
+
+                from core.config.settings import get_settings, invalidate_settings
+
                 mode = params.get("mode", "memory")
                 target = params.get("target", ":memory:")
                 if mode == "memory":
@@ -163,9 +171,11 @@ class RecoveryAgent:
     def _emit_webhook(event_name: str, reason: str) -> None:
         try:
             from core.config.settings import get_settings
+
             s = get_settings()
             if s.DISCORD_WEBHOOK:
                 import requests
+
                 requests.post(
                     s.DISCORD_WEBHOOK,
                     json={"content": f"[Pramana Recovery] **{event_name}**: {reason}"},

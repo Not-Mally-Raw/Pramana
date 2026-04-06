@@ -4,8 +4,7 @@ __all__ = [
     "fund_testnet",
     "register_agents",
     "behavior_simulator",
-    "monitor_dashboard",
-    "metrics_collector",
+    "monitor_metrics",
     "analyze_results",
     "testnet_emitter",
 ]

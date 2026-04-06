@@ -5,13 +5,15 @@ Decodes arbitrary smart contract calldata using a curated registry of top DeFi
 function selectors. Enables L1 agents to reason about intent (addresses, amounts)
 rather than raw hex strings.
 """
+
 import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, ConfigDict
+
 from eth_abi import decode
-from eth_utils import function_abi_to_4byte_selector, encode_hex
+from eth_utils import encode_hex, function_abi_to_4byte_selector
+from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger("pramana.parser")
 
@@ -32,25 +34,29 @@ def _safe_hex_bytes(hex_str: str) -> bytes:
     except (ValueError, AttributeError, TypeError):
         return b""
 
+
 class DecodedCall(BaseModel):
     """Structured representation of a decoded transaction call."""
+
     selector: str
     name: str
     protocol: str
     signature: str
     params: Dict[str, Any]
     risk: str = "normal"
-    
+
     # Store raw params for easy access
     addresses: List[str] = []
     strings: List[str] = []
 
     model_config = ConfigDict(extra="allow")
 
+
 class CalldataParser:
     """
     Parses Ethereum calldata into structured intents using a local registry.
     """
+
     def __init__(self):
         self._registry = self._load_registry()
 
@@ -85,7 +91,7 @@ class CalldataParser:
 
         entry = self._registry[selector]
         params_abi = entry.get("params", [])
-        
+
         types = []
         names = []
         for p in params_abi:
@@ -107,7 +113,7 @@ class CalldataParser:
                 decoded_values = decode(types, args_data)
 
             params_dict = dict(zip(names, decoded_values))
-            
+
             # Format addresses and sanitize bytes
             clean_params = {}
             for k, v in params_dict.items():
@@ -124,14 +130,14 @@ class CalldataParser:
                 protocol=entry["protocol"],
                 signature=entry["signature"],
                 params=clean_params,
-                risk=entry.get("risk", "normal")
+                risk=entry.get("risk", "normal"),
             )
-            
+
             # Extract common parameter types for rapid access
             call.addresses = self.extract_addresses(call)
             call.strings = self.extract_string_parameters(call)
             return call
-            
+
         except Exception as e:
             logger.debug(f"Failed to decode {selector} args: {e}")
             return None
@@ -139,7 +145,7 @@ class CalldataParser:
     def extract_addresses(self, call: DecodedCall) -> List[str]:
         """Extract all Ethereum addresses from the decoded parameters."""
         addresses = []
-        
+
         def _walk(obj):
             if isinstance(obj, str) and obj.startswith("0x") and len(obj) == 42:
                 addresses.append(obj.lower())
@@ -149,14 +155,14 @@ class CalldataParser:
             elif isinstance(obj, (list, tuple)):
                 for v in obj:
                     _walk(v)
-                    
+
         _walk(call.params)
         return list(set(addresses))
 
     def extract_string_parameters(self, call: DecodedCall) -> List[str]:
         """Extract all string parameters (useful for InjectionAgent checking)."""
         strings = []
-        
+
         def _walk(obj):
             if isinstance(obj, str) and not obj.startswith("0x"):
                 strings.append(obj)
@@ -166,7 +172,7 @@ class CalldataParser:
             elif isinstance(obj, (list, tuple)):
                 for v in obj:
                     _walk(v)
-                    
+
         _walk(call.params)
         return strings
 
@@ -186,20 +192,24 @@ class CalldataParser:
             # Gnosis/SimpleAccount/LightAccount/Kernel batch formats
             dests = top_call.params.get("dest", top_call.params.get("to", []))
             data_payloads = top_call.params.get("data", top_call.params.get("func", []))
-            
+
             # Normal array-of-arrays batch
-            if isinstance(data_payloads, list) and len(data_payloads) > 0 and isinstance(data_payloads[0], (bytes, str)):
+            if (
+                isinstance(data_payloads, list)
+                and len(data_payloads) > 0
+                and isinstance(data_payloads[0], (bytes, str))
+            ):
                 for hex_data in data_payloads:
                     if isinstance(hex_data, bytes):
                         hex_str = hex_data.hex()
                     else:
                         hex_str = hex_data.replace("0x", "")
-                    
+
                     if len(hex_str) >= 8:
                         inner = self.decode(hex_str)
                         if inner:
                             calls.append(inner)
-                            
+
             # Kernel tuple struct batch (calls: tuple[])
             if "calls" in top_call.params:
                 for batch_item in top_call.params["calls"]:
@@ -210,7 +220,7 @@ class CalldataParser:
                             hex_str = inner_data.hex()
                         else:
                             hex_str = inner_data.replace("0x", "")
-                        
+
                         if len(hex_str) >= 8:
                             inner = self.decode(hex_str)
                             if inner:
@@ -224,7 +234,7 @@ class CalldataParser:
                     hex_str = hex_data.hex()
                 else:
                     hex_str = hex_data.replace("0x", "")
-                
+
                 if len(hex_str) >= 8:
                     inner = self.decode(hex_str)
                     if inner:
@@ -232,12 +242,15 @@ class CalldataParser:
 
         return calls
 
+
 # Singleton instance
 parser = CalldataParser()
+
 
 def decode_calldata(hex_str: str) -> Optional[DecodedCall]:
     """Convenience function for top-level decoding."""
     return parser.decode(hex_str)
+
 
 def decode_all_calls(hex_str: str) -> List[DecodedCall]:
     """Convenience function for deep decoding (including batches)."""

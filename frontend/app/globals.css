@@ -1,0 +1,120 @@
+@import "tailwindcss";
+
+:root {
+  --canvas: #000000;
+  --surface-card: #0a0a0a;
+  --surface-elevated: #111111;
+  --border-subtle: #1a1a1a;
+
+  --pass-0: #00ff87;
+  --pass-1: #00d97e;
+  --warn-0: #ffb800;
+  --warn-1: #ff8c00;
+  --critical-0: #ff3366;
+  --critical-1: #ff0040;
+  --chain-0: #6366f1;
+  --chain-1: #8b5cf6;
+  --data-0: #3b82f6;
+  --data-1: #1d4ed8;
+
+  --text-primary: #ffffff;
+  --text-secondary: #a1a1aa;
+  --text-tertiary: #52525b;
+}
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-surface-card: var(--surface-card);
+  --color-surface-elevated: var(--surface-elevated);
+  --color-border-subtle: var(--border-subtle);
+
+  --color-pass-0: var(--pass-0);
+  --color-pass-1: var(--pass-1);
+  --color-warn-0: var(--warn-0);
+  --color-warn-1: var(--warn-1);
+  --color-critical-0: var(--critical-0);
+  --color-critical-1: var(--critical-1);
+  --color-chain-0: var(--chain-0);
+  --color-chain-1: var(--chain-1);
+  --color-data-0: var(--data-0);
+  --color-data-1: var(--data-1);
+
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-tertiary: var(--text-tertiary);
+
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-jetbrains);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(1200px circle at 8% 2%, rgba(59, 130, 246, 0.11), transparent 42%),
+    radial-gradient(900px circle at 92% 12%, rgba(255, 51, 102, 0.09), transparent 38%),
+    var(--canvas);
+  color: var(--text-primary);
+  font-family: var(--font-inter), sans-serif;
+}
+
+.number-display {
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+}
+
+.card-label {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.panel {
+  border: 1px solid var(--border-subtle);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0)), var(--surface-card);
+  border-radius: 14px;
+}
+
+.elevated {
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-elevated);
+}
+
+.risk-pulse {
+  animation: risk-pulse 2s ease-out infinite;
+}
+
+.amber-breathe {
+  animation: amber-breathe 2s ease-out infinite;
+}
+
+@keyframes risk-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 0, 64, 0.35);
+  }
+  100% {
+    box-shadow: 0 0 0 10px rgba(255, 0, 64, 0);
+  }
+}
+
+@keyframes amber-breathe {
+  0% {
+    opacity: 0.7;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.7;
+  }
+}

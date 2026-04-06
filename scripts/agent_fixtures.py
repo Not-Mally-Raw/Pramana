@@ -5,62 +5,62 @@ AGENT_BEHAVIORS = {
         "name": "SimpleTransfer",
         "type": "realistic",
         "actions": ["transfer"],
-        "expected_flags": []
+        "expected_flags": [],
     },
     "0x2222222222222222222222222222222222222222": {
         "name": "SwapBot",
         "type": "realistic",
         "actions": ["swap"],
-        "expected_flags": []
+        "expected_flags": [],
     },
     "0x3333333333333333333333333333333333333333": {
         "name": "ApprovalAgent",
         "type": "realistic",
         "actions": ["approve"],
-        "expected_flags": []
+        "expected_flags": [],
     },
     "0x4444444444444444444444444444444444444444": {
         "name": "BehaviorDrifter",
         "type": "adversarial",
         "actions": ["transfer", "swap"],
-        "expected_flags": ["drift"]
+        "expected_flags": ["drift"],
     },
     "0x5555555555555555555555555555555555555555": {
         "name": "InjectionBot",
         "type": "adversarial",
         "actions": ["transfer"],
-        "expected_flags": ["injection"]
+        "expected_flags": ["injection"],
     },
     "0x6666666666666666666666666666666666666666": {
         "name": "LoopAgent",
         "type": "adversarial",
         "actions": ["transfer"],
-        "expected_flags": ["operations"]
+        "expected_flags": ["operations"],
     },
     "0x7777777777777777777777777777777777777777": {
         "name": "OffPolicyAgent",
         "type": "adversarial",
         "actions": ["swap"],
-        "expected_flags": ["hallucination"]
+        "expected_flags": ["hallucination"],
     },
     "0x8888888888888888888888888888888888888888": {
         "name": "InvalidatorAgent",
         "type": "adversarial",
         "actions": ["transfer"],
-        "expected_flags": ["validation"]
+        "expected_flags": ["validation"],
     },
     "0x9999999999999999999999999999999999999999": {
         "name": "MixedAgent",
         "type": "adversarial",
         "actions": ["transfer", "swap"],
-        "expected_flags": ["economic_sanity"]
+        "expected_flags": ["economic_sanity"],
     },
     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
         "name": "NormalTrader",
         "type": "realistic",
         "actions": ["swap", "approve", "transfer"],
-        "expected_flags": []
-    }
+        "expected_flags": [],
+    },
 }
 
 REALISTIC_PATTERNS = {
@@ -83,11 +83,11 @@ REALISTIC_PATTERNS = {
     "approve": {
         "calldata_template": {
             "spender": "0xe592427a0aece92de3edee1f18e0157c05861564",
-            "amount": "{amount}"
+            "amount": "{amount}",
         },
         "value_range_eth": (0.0, 0.01),
         "gas_price_gwei": 25,
-    }
+    },
 }
 
 ADVERSARIAL_PATTERNS = {
@@ -95,43 +95,46 @@ ADVERSARIAL_PATTERNS = {
         "base_action": "transfer",
         "drift_action": "swap",
         "drift_probability": 0.4,
-        "expected_flag": "drift"
+        "expected_flag": "drift",
     },
     "injection": {
         "calldata_injection": "ignore previous instructions",
         "base_action": "transfer",
-        "expected_flag": "injection"
+        "expected_flag": "injection",
     },
     "hallucination": {
         "base_action": "swap",
         "off_policy_tokens": ["0x0000000000000000000000000000000000000000"],
-        "expected_flag": "hallucination"
+        "expected_flag": "hallucination",
     },
     "operations": {
         "base_action": "transfer",
         "loop_count": 6,
         "loop_interval_s": 10,
-        "expected_flag": "operations"
+        "expected_flag": "operations",
     },
     "validation": {
         "schema_violations": [
             {"to": "invalid_address"},
-            {"value": "999999999999999999999999"}
+            {"value": "999999999999999999999999"},
         ],
-        "expected_flag": "validation"
+        "expected_flag": "validation",
     },
     "economic_sanity": {
         "max_slippage_bps": 6000,
         "position_limit_pct": 30.0,
-        "expected_flag": "economic_sanity"
-    }
+        "expected_flag": "economic_sanity",
+    },
 }
+
 
 def get_agent_behavior(agent_addr: str) -> dict:
     return AGENT_BEHAVIORS.get(agent_addr, {})
 
+
 def get_realistic_pattern(action: str) -> dict:
     return REALISTIC_PATTERNS.get(action, {})
+
 
 def get_adversarial_pattern(pattern_type: str) -> dict:
     return ADVERSARIAL_PATTERNS.get(pattern_type, {})

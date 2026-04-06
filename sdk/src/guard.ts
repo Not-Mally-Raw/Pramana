@@ -6,6 +6,7 @@
 
 import axios from "axios";
 import type { GuardCheckRequest, GuardCheckResponse, PramanaConfig } from "./types";
+import { buildPramanaHeaders } from "./http";
 
 export class PramanaGuard {
   constructor(private readonly config: PramanaConfig) {}
@@ -39,7 +40,7 @@ export class PramanaGuard {
           gas_price: number;
         },
         {
-          headers: { "X-Org-Id": this.config.orgId },
+          headers: buildPramanaHeaders(this.config),
           timeout: 3000,
         }
       );

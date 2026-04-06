@@ -121,6 +121,7 @@ export interface PramanaConfig {
   apiUrl: string;       // http://localhost:8000
   orgId: string;
   agentId: string;
+  apiToken?: string;    // optional JWT bearer token for protected API routes
   enabled?: boolean;    // default: true
   guardEnabled?: boolean; // default: true — block on injection detection
   guardFailMode?: "fail_open" | "fail_closed"; // default: fail_open

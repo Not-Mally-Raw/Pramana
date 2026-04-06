@@ -8,15 +8,19 @@ a structured RecoveryAlert to the operator webhook.
 
 This service NEVER executes position actions. Advisory only.
 """
+
 from __future__ import annotations
 
 import json
 import logging
+import statistics
 import time
 import uuid
-from typing import List, Optional
+from typing import Optional
 
 import httpx
+
+from core.config.settings import get_settings
 
 from utils.models import (
     OpenPosition,
@@ -39,20 +43,26 @@ class FinancialRecoveryService:
     - WARNING:  health_factor 1.05-1.20 OR hours_to_liquidation 4-24
     - SAFE:     health_factor > 1.20 OR no liquidation risk
 
-    Liquidation time estimate uses 3% hourly volatility assumption
-    (conservative for ETH/major assets, may underestimate for altcoins).
+    Liquidation time estimate uses dynamic hourly volatility derived from
+    recent position health-factor changes, with conservative fallback.
     """
 
-    HOURLY_VOLATILITY = 0.03  # 3% per hour — conservative ETH estimate
+    VOLATILITY_FALLBACK = 0.05  # 5% per hour conservative fallback
+    LEVERAGED_TYPES = {
+        PositionType.LENDING,
+        PositionType.COLLATERAL,
+        PositionType.PERP,
+    }
 
     def classify_position(
         self,
         pos: OpenPosition,
         rpc_url: str,
+        current_block: int | None = None,
     ) -> PositionClassification:
         """Classify a single position by liquidation risk."""
-        if pos.position_type in (PositionType.LENDING, PositionType.COLLATERAL, PositionType.PERP):
-            return self._classify_leveraged(pos, rpc_url)
+        if pos.position_type in self.LEVERAGED_TYPES:
+            return self._classify_leveraged(pos, rpc_url, current_block=current_block)
         if pos.position_type == PositionType.LP:
             return self._classify_lp(pos)
         return PositionClassification(
@@ -67,6 +77,7 @@ class FinancialRecoveryService:
         self,
         pos: OpenPosition,
         rpc_url: str,
+        current_block: int | None = None,
     ) -> PositionClassification:
         hf = pos.health_factor
 
@@ -84,9 +95,30 @@ class FinancialRecoveryService:
                 reasoning="Health factor unavailable from RPC. Treating as WARNING — reduce exposure.",
             )
 
-        hours = self._estimate_hours_to_liquidation(hf)
+        hours = self._estimate_hours_to_liquidation(
+            health_factor=hf,
+            protocol=pos.protocol,
+            asset=pos.asset,
+        )
 
-        if hf < 1.05 and not pos.is_finalized:
+        # Finality-aware confidence: treat as effectively-final once confirmed.
+        s = get_settings()
+        finality_depth: int | None = None
+        if current_block is not None and pos.last_updated_block:
+            try:
+                finality_depth = max(0, int(current_block) - int(pos.last_updated_block))
+            except Exception:
+                finality_depth = None
+        effectively_final = bool(pos.is_finalized) or (
+            finality_depth is not None and finality_depth >= int(s.FINALITY_DEPTH_BLOCKS)
+        )
+
+        if hf < 1.05 and not effectively_final:
+            depth_hint = (
+                f" (depth {finality_depth} < {int(s.FINALITY_DEPTH_BLOCKS)})"
+                if finality_depth is not None
+                else ""
+            )
             return PositionClassification(
                 position=pos,
                 risk_level=PositionRisk.WARNING,
@@ -94,7 +126,7 @@ class FinancialRecoveryService:
                 suggested_action=SuggestedAction.REDUCE,
                 reasoning=(
                     f"Health factor {hf:.3f} is low, but position is not finalized yet. "
-                    "Classified as recoverable under proactive fee/bundle strategy."
+                    f"Classified as recoverable under proactive fee/bundle strategy{depth_hint}."
                 ),
             )
 
@@ -132,16 +164,74 @@ class FinancialRecoveryService:
             reasoning="LP position. No liquidation risk. Check if price is within active range.",
         )
 
-    def _estimate_hours_to_liquidation(self, health_factor: float) -> float:
+    def _estimate_hours_to_liquidation(
+        self,
+        health_factor: float,
+        protocol: str,
+        asset: str,
+    ) -> float:
         """
         Rough estimate: buffer / hourly_volatility.
         Buffer = (hf - 1.0) / hf as fraction of collateral value.
-        At 3% hourly vol: hf=1.05 -> ~1.7h, hf=1.10 -> ~3.2h, hf=1.20 -> ~6.7h
+        Volatility is computed from recent position history and clamped.
         """
         if health_factor <= 1.0:
             return 0.0
         buffer = (health_factor - 1.0) / health_factor
-        return buffer / self.HOURLY_VOLATILITY
+        return buffer / self._compute_dynamic_volatility(protocol=protocol, asset=asset)
+
+    def _compute_dynamic_volatility(
+        self,
+        protocol: str,
+        asset: str,
+        lookback_hours: int = 24,
+    ) -> float:
+        """
+        Compute hourly volatility using observed health-factor changes.
+        Falls back conservatively when insufficient data is available.
+        """
+        try:
+            from core.db import get_sqlite_conn
+
+            cutoff_ts = int(time.time()) - (lookback_hours * 3600)
+
+            with get_sqlite_conn() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT health_factor
+                    FROM open_positions
+                    WHERE protocol = ? AND asset = ?
+                      AND last_updated_ts > ?
+                      AND is_closed = 0
+                    ORDER BY last_updated_ts ASC
+                    """,
+                    (protocol, asset, cutoff_ts),
+                ).fetchall()
+
+            hf_values = [float(v) for (v,) in rows if v is not None and float(v) > 0.0]
+            if len(hf_values) < 10:
+                return self.VOLATILITY_FALLBACK
+
+            changes = [
+                abs(curr - prev) / prev
+                for prev, curr in zip(hf_values, hf_values[1:])
+                if prev > 0.0
+            ]
+            if not changes:
+                return self.VOLATILITY_FALLBACK
+
+            computed = statistics.stdev(changes) if len(changes) > 1 else changes[0]
+            # Clamp to avoid unstable near-zero and unrealistic spikes.
+            return max(min(computed, 0.50), 0.005)
+        except Exception as e:
+            logger.warning(
+                "Dynamic volatility failed for %s/%s: %s. Using fallback %.3f",
+                protocol,
+                asset,
+                e,
+                self.VOLATILITY_FALLBACK,
+            )
+            return self.VOLATILITY_FALLBACK
 
     def _fetch_health_factor_safe(
         self,
@@ -160,7 +250,9 @@ class FinancialRecoveryService:
 
             # Aave V3 — getUserAccountData returns healthFactor as last field.
             if "aave" in pos.protocol.lower():
-                aave_v3_pool = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"
+                aave_v3_pool = w3.to_checksum_address(
+                    "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"
+                )
                 abi = [
                     {
                         "inputs": [{"name": "user", "type": "address"}],
@@ -186,12 +278,40 @@ class FinancialRecoveryService:
             logger.warning("Health factor fetch failed for %s: %s", pos.agent_addr, e)
         return None
 
+    @staticmethod
+    def _get_current_block_safe(rpc_url: str) -> int | None:
+        """Fetch latest block number with a short timeout.
+
+        Uses JSON-RPC directly to avoid heavyweight client init.
+        Returns None on any failure.
+        """
+        if not rpc_url:
+            return None
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_blockNumber",
+                "params": [],
+            }
+            with httpx.Client(timeout=1.5) as client:
+                resp = client.post(rpc_url, json=payload)
+            if resp.status_code >= 300:
+                return None
+            data = resp.json()
+            block_hex = data.get("result")
+            if not isinstance(block_hex, str) or not block_hex.startswith("0x"):
+                return None
+            return int(block_hex, 16)
+        except Exception:
+            return None
+
     def generate_alert(
         self,
         agent_addr: str,
         org_id: str,
         trace_hash: str,
-        positions: List[OpenPosition],
+        positions: list[OpenPosition],
         rpc_url: str,
     ) -> RecoveryAlert:
         """
@@ -199,13 +319,22 @@ class FinancialRecoveryService:
         Called immediately when an agent transitions to PAUSED.
         Must complete within 5 seconds — RPC calls have 2s timeout each.
         """
-        classifications = [self.classify_position(pos, rpc_url) for pos in positions]
-
-        critical = [c for c in classifications if c.risk_level == PositionRisk.CRITICAL]
-        warning = [c for c in classifications if c.risk_level == PositionRisk.WARNING]
-        safe = [c for c in classifications if c.risk_level == PositionRisk.SAFE]
-
-        total_at_risk = sum(c.position.current_usd_value for c in critical + warning)
+        current_block = self._get_current_block_safe(rpc_url)
+        classifications = [
+            self.classify_position(pos, rpc_url, current_block=current_block)
+            for pos in positions
+        ]
+        critical = warning = safe = 0
+        total_at_risk = 0.0
+        for cls in classifications:
+            if cls.risk_level == PositionRisk.CRITICAL:
+                critical += 1
+                total_at_risk += cls.position.current_usd_value
+            elif cls.risk_level == PositionRisk.WARNING:
+                warning += 1
+                total_at_risk += cls.position.current_usd_value
+            else:
+                safe += 1
 
         return RecoveryAlert(
             alert_id=str(uuid.uuid4()),
@@ -215,9 +344,9 @@ class FinancialRecoveryService:
             pause_timestamp=int(time.time()),
             classifications=classifications,
             total_usd_at_risk=total_at_risk,
-            critical_count=len(critical),
-            warning_count=len(warning),
-            safe_count=len(safe),
+            critical_count=critical,
+            warning_count=warning,
+            safe_count=safe,
             webhook_delivered=False,
             webhook_ts=None,
         )
@@ -278,7 +407,7 @@ def _persist_recovery_alert(alert: RecoveryAlert) -> None:
         )
 
 
-def _fetch_open_positions(agent_addr: str, org_id: str) -> List[OpenPosition]:
+def _fetch_open_positions(agent_addr: str, org_id: str) -> list[OpenPosition]:
     """Fetch all non-closed positions for an agent from SQLite."""
     from core.db import get_sqlite_conn
 
@@ -296,29 +425,27 @@ def _fetch_open_positions(agent_addr: str, org_id: str) -> List[OpenPosition]:
             (agent_addr, org_id),
         ).fetchall()
 
-    positions = []
-    for row in rows:
-        positions.append(
-            OpenPosition(
-                position_id=row[0],
-                agent_addr=row[1],
-                org_id=row[2],
-                protocol=row[3],
-                position_type=PositionType(row[4]),
-                asset=row[5],
-                amount_wei=int(row[6]),
-                usd_value_at_entry=row[7] or 0.0,
-                current_usd_value=row[8] or 0.0,
-                health_factor=row[9],
-                liquidation_threshold=row[10],
-                chain_id=row[11],
-                block_entered=row[12] or 0,
-                last_updated_block=row[13] or 0,
-                last_updated_ts=row[14] or 0,
-                is_finalized=bool(row[15]),
-            )
+    return [
+        OpenPosition(
+            position_id=row[0],
+            agent_addr=row[1],
+            org_id=row[2],
+            protocol=row[3],
+            position_type=PositionType(row[4]),
+            asset=row[5],
+            amount_wei=int(row[6]),
+            usd_value_at_entry=row[7] or 0.0,
+            current_usd_value=row[8] or 0.0,
+            health_factor=row[9],
+            liquidation_threshold=row[10],
+            chain_id=row[11],
+            block_entered=row[12] or 0,
+            last_updated_block=row[13] or 0,
+            last_updated_ts=row[14] or 0,
+            is_finalized=bool(row[15]),
         )
-    return positions
+        for row in rows
+    ]
 
 
 def _get_operator_webhook(org_id: str) -> str:

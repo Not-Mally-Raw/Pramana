@@ -2,6 +2,7 @@
 core/scheduler.py — APScheduler background jobs.
 Runs reputation updates, DB eviction, and health checks on configurable intervals.
 """
+
 from __future__ import annotations
 
 import logging
@@ -23,6 +24,7 @@ def get_scheduler() -> AsyncIOScheduler:
 def start_scheduler() -> None:
     s = get_scheduler()
     from core.config.settings import get_settings
+
     cfg = get_settings()
 
     # ── Job 1: Reputation update every 5 minutes ──────────────────────────
@@ -78,10 +80,12 @@ def stop_scheduler() -> None:
 
 # ── Job implementations ───────────────────────────────────────────────────────
 
+
 async def _update_reputation_all_orgs() -> None:
     try:
         from core.agents.reputation import ReputationAgent
         from core.db import get_sqlite_conn
+
         with get_sqlite_conn() as conn:
             orgs = conn.execute("SELECT DISTINCT org_id FROM agents").fetchall()
         agent = ReputationAgent()
@@ -94,6 +98,7 @@ async def _update_reputation_all_orgs() -> None:
 async def _evict_old_events() -> None:
     try:
         from core.db import evict_old_rows, get_sqlite_conn
+
         with get_sqlite_conn() as conn:
             orgs = conn.execute("SELECT DISTINCT org_id FROM events").fetchall()
         for (org_id,) in orgs:
@@ -105,6 +110,7 @@ async def _evict_old_events() -> None:
 async def _refresh_routing_cache() -> None:
     try:
         from utils.cache import invalidate_routing_cache
+
         invalidate_routing_cache()
     except Exception as e:
         logger.debug("Routing cache refresh: %s", e)
@@ -113,11 +119,18 @@ async def _refresh_routing_cache() -> None:
 async def _node_health_check() -> None:
     try:
         import requests
+
         from core.config.settings import get_settings
+
         s = get_settings()
         resp = requests.post(
             s.active_rpc,
-            json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 99},
+            json={
+                "jsonrpc": "2.0",
+                "method": "eth_blockNumber",
+                "params": [],
+                "id": 99,
+            },
             timeout=3,
         )
         if resp.status_code != 200:

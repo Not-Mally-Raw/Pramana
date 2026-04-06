@@ -17,6 +17,7 @@ type RuntimePlugin = Plugin & {
 export interface PramanaPluginOptions {
   apiUrl?: string;       // default: http://localhost:8000
   orgId?: string;        // required
+  apiToken?: string;     // optional JWT bearer token for protected API routes
   enabled?: boolean;     // default: true
   guardEnabled?: boolean;
   guardFailMode?: "fail_open" | "fail_closed";
@@ -28,6 +29,7 @@ function resolveConfig(runtime: IAgentRuntime, opts: PramanaPluginOptions): Pram
   return {
     apiUrl:        opts.apiUrl       ?? (runtime.getSetting?.("PRAMANA_API_URL") as string | undefined) ?? "http://localhost:8000",
     orgId:         opts.orgId        ?? (runtime.getSetting?.("PRAMANA_ORG_ID")  as string | undefined) ?? "default",
+    apiToken:      opts.apiToken     ?? (runtime.getSetting?.("PRAMANA_API_TOKEN") as string | undefined),
     agentId,
     enabled:       opts.enabled       ?? true,
     guardEnabled:  opts.guardEnabled  ?? true,

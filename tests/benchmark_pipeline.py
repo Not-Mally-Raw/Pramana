@@ -3,24 +3,25 @@ tests/benchmark_pipeline.py — 100-tx throughput benchmark against Anvil.
 Measures per-event latency for the full L1 monitoring pipeline.
 Run: python tests/benchmark_pipeline.py
 """
+
 from __future__ import annotations
 
 import os
-import sys
-import time
 import random
 import statistics
+import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 os.environ["SQLITE_PATH"] = ":memory:"
-os.environ["DUCKDB_PATH"]  = ":memory:"
-os.environ["NETWORK"]      = "anvil"
+os.environ["DUCKDB_PATH"] = ":memory:"
+os.environ["NETWORK"] = "anvil"
 os.environ["GROQ_API_KEY"] = "bench_key"
 os.environ["ORCHESTRATOR_ADDR"] = ""
 
-from core.db import init_duckdb, init_sqlite
 from core.crews.monitoring import MonitoringCrew
+from core.db import init_duckdb, init_sqlite
 from utils.models import ChainEvent, DegradedMode, PramanaState
 
 init_sqlite()
@@ -73,9 +74,9 @@ def run_benchmark(n: int = 100) -> None:
             print(f"  Progress: {i+1}/{n} events processed")
 
     # ── Stats ──────────────────────────────────────────────────────────────────
-    p50  = statistics.median(latencies)
-    p95  = sorted(latencies)[int(len(latencies) * 0.95)]
-    p99  = sorted(latencies)[int(len(latencies) * 0.99)]
+    p50 = statistics.median(latencies)
+    p95 = sorted(latencies)[int(len(latencies) * 0.95)]
+    p99 = sorted(latencies)[int(len(latencies) * 0.99)]
     mean = statistics.mean(latencies)
     total_flags = sum(flag_counts)
 
@@ -91,8 +92,8 @@ def run_benchmark(n: int = 100) -> None:
     print(f"{'='*60}\n")
 
     # ── Assertions ──────────────────────────────────────────────────────────
-    assert p50  < 200,  f"p50 latency too high: {p50:.1f}ms"
-    assert p95  < 500,  f"p95 latency too high: {p95:.1f}ms"
+    assert p50 < 200, f"p50 latency too high: {p50:.1f}ms"
+    assert p95 < 500, f"p95 latency too high: {p95:.1f}ms"
     print("  ✅ All latency targets met!")
 
 

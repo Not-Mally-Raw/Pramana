@@ -3,8 +3,10 @@ core/agents/reputation.py — Reputation score aggregator (L2).
 Reads DuckDB analytics → computes composite score → writes to SBT via batchUpdateScores.
 Formula: (success*40 + roi*20 + uptime*25 + (1000-halluc)*15) / 1000
 """
+
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from utils.models import ReputationData
@@ -44,6 +46,10 @@ class ReputationAgent:
     def _compute_score(agent_addr: str, org_id: str) -> ReputationData | None:
         try:
             from core.db import get_duck_conn
+
+            # Compute reputation over a recent window to allow decay/regeneration.
+            window_days = 30
+
             with get_duck_conn() as conn:
                 row = conn.execute(
                     """
@@ -52,19 +58,37 @@ class ReputationAgent:
                         AVG(avg_risk)     AS avg_risk,
                         COUNT(*)          AS window_count,
                         SUM(tx_count)     AS total_tx,
-                        AVG(flag_count * 1.0 / NULLIF(tx_count, 0)) AS halluc_rate
+                        AVG(flag_count * 1.0 / NULLIF(tx_count, 0)) AS halluc_rate,
+                        MAX(window_ts)    AS last_window_ts
                     FROM agent_metrics
                     WHERE agent_addr = ? AND org_id = ?
+                      AND window_ts >= now() - INTERVAL (?) DAY
                     """,
-                    [agent_addr, org_id],
+                    [agent_addr, org_id, window_days],
                 ).fetchone()
 
-            if not row or row[2] == 0:
-                return None
+                if not row or row[2] == 0:
+                    return None
+
+                last_window_ts = row[5]
+
+                # Last incident = most recent window with any flags.
+                incident = conn.execute(
+                    """
+                    SELECT window_ts, flag_count, tx_count
+                    FROM agent_metrics
+                    WHERE agent_addr = ? AND org_id = ?
+                      AND flag_count > 0
+                      AND window_ts >= now() - INTERVAL (?) DAY
+                    ORDER BY window_ts DESC
+                    LIMIT 1
+                    """,
+                    [agent_addr, org_id, window_days],
+                ).fetchone()
 
             success = float(row[0] or 0.0)
             roi = max(0.0, 1.0 - float(row[1] or 0.0))  # inverse of avg risk
-            uptime = min(float(row[2]) / 10.0, 1.0)       # ~10 windows = full uptime
+            uptime = min(float(row[2]) / 10.0, 1.0)  # ~10 windows = full uptime
             halluc = float(row[4] or 0.0)
 
             # Scale to 0–1000 for on-chain uint16
@@ -74,7 +98,38 @@ class ReputationAgent:
             h_1000 = int(halluc * 1000)
 
             # Composite: 40% success + 20% roi + 25% uptime + 15% inverse-halluc
-            composite = (s_1000 * 40 + r_1000 * 20 + u_1000 * 25 + (1000 - h_1000) * 15) // 100
+            composite = (
+                s_1000 * 40 + r_1000 * 20 + u_1000 * 25 + (1000 - h_1000) * 15
+            ) // 100
+
+            composite_score = composite / 1000.0
+
+            # Incident decay/regeneration: a recent incident decays reputation,
+            # and the penalty fades as the agent remains incident-free.
+            penalty = 0.0
+            if incident and last_window_ts:
+                incident_ts, incident_flags, incident_tx = incident
+                try:
+                    age_days = max(
+                        0.0,
+                        (last_window_ts - incident_ts).total_seconds() / 86400.0,
+                    )
+                except Exception:
+                    age_days = 0.0
+
+                severity = 1.0
+                try:
+                    incident_tx_int = int(incident_tx or 0)
+                    if incident_tx_int > 0:
+                        severity = min(1.0, float(incident_flags or 0) / incident_tx_int)
+                except Exception:
+                    severity = 1.0
+
+                max_penalty = 0.25
+                tau_days = 7.0
+                penalty = max_penalty * severity * math.exp(-age_days / tau_days)
+
+            composite_score = max(0.0, min(1.0, composite_score - penalty))
 
             return ReputationData(
                 agent_addr=agent_addr,
@@ -83,8 +138,9 @@ class ReputationAgent:
                 roi_score=roi,
                 uptime_score=uptime,
                 halluc_rate=halluc,
-                composite_score=composite / 1000.0,
+                composite_score=composite_score,
                 tx_count=int(row[3] or 0),
+                period_days=window_days,
             )
         except Exception:
             return None
@@ -94,7 +150,9 @@ class ReputationAgent:
     @staticmethod
     def _write_sqlite(rep: ReputationData) -> None:
         from datetime import datetime, timezone
+
         from core.db import get_sqlite_conn
+
         with get_sqlite_conn() as conn:
             conn.execute(
                 """
@@ -107,9 +165,14 @@ class ReputationAgent:
                   composite=excluded.composite, tx_count=excluded.tx_count, updated_at=excluded.updated_at
                 """,
                 (
-                    rep.agent_addr, rep.org_id,
-                    rep.success_rate, rep.roi_score, rep.uptime_score,
-                    rep.halluc_rate, rep.composite_score, rep.tx_count,
+                    rep.agent_addr,
+                    rep.org_id,
+                    rep.success_rate,
+                    rep.roi_score,
+                    rep.uptime_score,
+                    rep.halluc_rate,
+                    rep.composite_score,
+                    rep.tx_count,
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
@@ -117,7 +180,9 @@ class ReputationAgent:
     @staticmethod
     def _append_duck_history(rep: ReputationData) -> None:
         from datetime import datetime, timezone
+
         from core.db import get_duck_conn
+
         with get_duck_conn() as conn:
             conn.execute(
                 """
@@ -126,10 +191,14 @@ class ReputationAgent:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    rep.agent_addr, rep.org_id,
+                    rep.agent_addr,
+                    rep.org_id,
                     datetime.now(timezone.utc),
-                    rep.composite_score, rep.success_rate,
-                    rep.roi_score, rep.uptime_score, rep.halluc_rate,
+                    rep.composite_score,
+                    rep.success_rate,
+                    rep.roi_score,
+                    rep.uptime_score,
+                    rep.halluc_rate,
                 ],
             )
 
@@ -138,16 +207,20 @@ class ReputationAgent:
     @staticmethod
     def _batch_update_sbt(reps: list[ReputationData]) -> None:
         try:
-            from core.config.settings import get_settings
-            from web3 import Web3
             import json
+
+            from web3 import Web3
+
+            from core.config.settings import get_settings
+
             s = get_settings()
             if not s.SBT_ADDR or not s.DEPLOYER_KEY:
                 return
 
             w3 = Web3(Web3.HTTPProvider(s.active_rpc))
             # Minimal ABI for batchUpdateScores
-            abi = json.loads("""[
+            abi = json.loads(
+                """[
               {"inputs":[
                 {"name":"tokenIds","type":"uint256[]"},
                 {"name":"successRates","type":"uint16[]"},
@@ -155,14 +228,21 @@ class ReputationAgent:
                 {"name":"uptimeScores","type":"uint16[]"},
                 {"name":"hallucRates","type":"uint16[]"}
               ],"name":"batchUpdateScores","outputs":[],"stateMutability":"nonpayable","type":"function"}
-            ]""")
-            contract = w3.eth.contract(address=s.SBT_ADDR, abi=abi)
+            ]"""
+            )
+            contract = w3.eth.contract(
+                address=w3.to_checksum_address(s.SBT_ADDR), abi=abi
+            )
 
             # Fix 5: Look up actual token IDs from SBT contract instead of
             # using positional range(1, N). The old code corrupted scores
             # whenever the agent list changed order or an agent was removed.
-            token_id_map = self._get_agent_token_ids(reps, w3, s.SBT_ADDR)
-            valid_reps = [(r, tid) for r in reps if (tid := token_id_map.get(r.agent_addr)) is not None]
+            token_id_map = ReputationAgent._get_agent_token_ids(reps, w3, s.SBT_ADDR)
+            valid_reps = [
+                (r, tid)
+                for r in reps
+                if (tid := token_id_map.get(r.agent_addr)) is not None
+            ]
 
             if not valid_reps:
                 return
@@ -173,16 +253,18 @@ class ReputationAgent:
             fn = contract.functions.batchUpdateScores(
                 token_ids,
                 [int(r.success_rate * 1000) for r in valid_rep_objs],
-                [int(r.roi_score * 1000)    for r in valid_rep_objs],
+                [int(r.roi_score * 1000) for r in valid_rep_objs],
                 [int(r.uptime_score * 1000) for r in valid_rep_objs],
-                [int(r.halluc_rate * 1000)  for r in valid_rep_objs],
+                [int(r.halluc_rate * 1000) for r in valid_rep_objs],
             )
             acct = w3.eth.account.from_key(s.DEPLOYER_KEY)
-            tx = fn.build_transaction({
-                "from": acct.address,
-                "nonce": w3.eth.get_transaction_count(acct.address),
-                "gas": 200_000,
-            })
+            tx = fn.build_transaction(
+                {
+                    "from": acct.address,
+                    "nonce": w3.eth.get_transaction_count(acct.address),
+                    "gas": 200_000,
+                }
+            )
             signed = acct.sign_transaction(tx)
             w3.eth.send_raw_transaction(signed.raw_transaction)
         except Exception:
@@ -192,9 +274,11 @@ class ReputationAgent:
     def _list_org_agents(org_id: str) -> list[str]:
         try:
             from core.db import get_sqlite_conn
+
             with get_sqlite_conn() as conn:
                 rows = conn.execute(
-                    "SELECT agent_addr FROM agents WHERE org_id=? AND paused=0", (org_id,)
+                    "SELECT agent_addr FROM agents WHERE org_id=? AND paused=0",
+                    (org_id,),
                 ).fetchall()
             return [r[0] for r in rows]
         except Exception:
@@ -208,12 +292,17 @@ class ReputationAgent:
         wrong agents whenever the list order changed or agents were added/removed.
         """
         import json
-        token_of_abi = json.loads("""[
+
+        token_of_abi = json.loads(
+            """[
           {"inputs":[{"name":"","type":"address"}],
            "name":"tokenOf","outputs":[{"name":"","type":"uint256"}],
            "stateMutability":"view","type":"function"}
-        ]""")
-        sbt = w3.eth.contract(address=sbt_addr, abi=token_of_abi)
+        ]"""
+        )
+        sbt = w3.eth.contract(
+            address=w3.to_checksum_address(sbt_addr), abi=token_of_abi
+        )
         result = {}
         for r in reps:
             try:

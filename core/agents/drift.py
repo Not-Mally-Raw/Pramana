@@ -5,6 +5,7 @@ Pass 1: cosine similarity vs baseline cluster. <80ms.
 Pass 2 (borderline): compare vs 10-tx rolling window average.
 Skipped in DegradedMode.NO_VECTORS.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -26,27 +27,43 @@ class DriftMonitorAgent(BaseL1Agent):
 
         # Skip if vectors unavailable
         if state.degraded_mode and "NO_VECTORS" in str(state.degraded_mode):
-            return self._make_result(self.name, False, 0.0, "drift check skipped (NO_VECTORS)", meta)
+            return self._make_result(
+                self.name, False, 0.0, "drift check skipped (NO_VECTORS)", meta
+            )
 
         # Build behavior text: action + first 256 chars of calldata
         behavior_text = f"{event.action} {(event.calldata or '')[:256]}"
         meta["behavior_len"] = len(behavior_text)
 
-        similarity = self._baseline_similarity(event.agent_id, event.org_id, behavior_text)
+        similarity = self._baseline_similarity(
+            event.agent_id, event.org_id, behavior_text
+        )
         meta["baseline_similarity"] = round(similarity, 4)
 
         if similarity < s.DRIFT_SIMILARITY_THRESHOLD:
             deviation = 1.0 - similarity
             score = min(deviation * 1.5, 1.0)
             reason = f"drift detected: similarity {similarity:.3f} < {s.DRIFT_SIMILARITY_THRESHOLD}"
-            self._store_embedding(event.agent_id, event.org_id, behavior_text, event.tx_hash or "", similarity)
+            self._store_embedding(
+                event.agent_id,
+                event.org_id,
+                behavior_text,
+                event.tx_hash or "",
+                similarity,
+            )
             return self._make_result(self.name, True, score, reason, meta)
 
         # Update baseline with new good behavior
-        self._store_embedding(event.agent_id, event.org_id, behavior_text, event.tx_hash or "", similarity)
-        return self._make_result(self.name, False, 0.0, "behavior within baseline", meta)
+        self._store_embedding(
+            event.agent_id, event.org_id, behavior_text, event.tx_hash or "", similarity
+        )
+        return self._make_result(
+            self.name, False, 0.0, "behavior within baseline", meta
+        )
 
-    def verify(self, event: ChainEvent, state: PramanaState, first: L1Result) -> L1Result:
+    def verify(
+        self, event: ChainEvent, state: PramanaState, first: L1Result
+    ) -> L1Result:
         """Second pass: compare against rolling N-tx window (profile-aware).
 
         Fix 11: Window size is now per-profile via DRIFT_WINDOW_TXS.
@@ -58,7 +75,9 @@ class DriftMonitorAgent(BaseL1Agent):
 
         # Load profile-aware drift window size
         profile = state.agent_profile or "generic"
-        thresholds = s.AGENT_PROFILE_THRESHOLDS.get(profile, s.AGENT_PROFILE_THRESHOLDS["generic"])
+        thresholds = s.AGENT_PROFILE_THRESHOLDS.get(
+            profile, s.AGENT_PROFILE_THRESHOLDS["generic"]
+        )
         drift_window = thresholds.get("DRIFT_WINDOW_TXS", 10)
         meta["drift_window_txs"] = drift_window
 
@@ -69,15 +88,21 @@ class DriftMonitorAgent(BaseL1Agent):
 
         if rolling_sim < 0.60:
             return self._make_result(
-                self.name, True,
+                self.name,
+                True,
                 min(first.score + 0.10, 1.0),
-                first.reason + f" (rolling sim {rolling_sim:.3f}, window={drift_window})",
-                meta, pass_count=2
+                first.reason
+                + f" (rolling sim {rolling_sim:.3f}, window={drift_window})",
+                meta,
+                pass_count=2,
             )
         return self._make_result(
-            self.name, first.flagged,
+            self.name,
+            first.flagged,
             max(first.score - 0.05, 0.0),
-            first.reason + " (rolling window ok)", meta, pass_count=2
+            first.reason + " (rolling window ok)",
+            meta,
+            pass_count=2,
         )
 
     # ── Internals ─────────────────────────────────────────────────────────────
@@ -86,12 +111,14 @@ class DriftMonitorAgent(BaseL1Agent):
     def _baseline_similarity(agent_id: str, org_id: str, text: str) -> float:
         from core.config.settings import get_settings as _gs
         from utils.cache import EMBEDDING_CACHE
+
         cache_key = f"drift:{agent_id}:{hash(text)}"
         if cache_key in EMBEDDING_CACHE:
             return EMBEDDING_CACHE[cache_key]
-            
+
         try:
             import chromadb
+
             s = _gs()
             client = chromadb.PersistentClient(path=s.CHROMA_PATH)
             col = client.get_or_create_collection(
@@ -102,37 +129,42 @@ class DriftMonitorAgent(BaseL1Agent):
             count = col.count()
             if count == 0:
                 return 0.85  # no baseline yet → assume ok
-                
+
             results = col.query(query_texts=[text], n_results=min(10, count))
             distances = results.get("distances", [[]])[0]
             if not distances:
                 return 0.85
-                
+
             # RANSAC centroid check
             avg_dist = sum(distances) / len(distances)
             sim = 1.0 - avg_dist
-            
+
             EMBEDDING_CACHE[cache_key] = sim
             return sim
         except Exception:
             return 0.85  # fail safe → assume ok
 
     @staticmethod
-    def _store_embedding(agent_id: str, org_id: str, text: str, doc_id: str, similarity: float = 1.0) -> None:
+    def _store_embedding(
+        agent_id: str, org_id: str, text: str, doc_id: str, similarity: float = 1.0
+    ) -> None:
         """Stores embedding with RANSAC >1.5 sigma outlier rejection and 500 cap pruning."""
         try:
             import time
+
             import chromadb
+
             from core.config.settings import get_settings as _gs
+
             s = _gs()
             client = chromadb.PersistentClient(path=s.CHROMA_PATH)
             col = client.get_or_create_collection(
                 f"baseline_{agent_id}_{org_id}",
                 metadata={"hnsw:space": "cosine"},
             )
-            
+
             count = col.count()
-            
+
             # 1. RANSAC Outlier Rejection during Bootstrap
             # If we have a reasonable baseline (e.g. >10 txs) and the similarity drops hard, reject it.
             if count >= 10 and similarity < 0.65:
@@ -142,14 +174,10 @@ class DriftMonitorAgent(BaseL1Agent):
             meta = {
                 "version": "1.0",
                 "timestamp": int(time.time()),
-                "is_centroid": False
+                "is_centroid": False,
             }
-            
-            col.upsert(
-                documents=[text], 
-                ids=[doc_id or text[:36]],
-                metadatas=[meta]
-            )
+
+            col.upsert(documents=[text], ids=[doc_id or text[:36]], metadatas=[meta])
 
             # 3. Baseline pruning (cap at 500 embeddings)
             if count >= 500:
@@ -159,23 +187,27 @@ class DriftMonitorAgent(BaseL1Agent):
                     pairs = list(zip(all_docs["ids"], all_docs["metadatas"]))
                     # Sort by timestamp ascending (oldest first)
                     pairs.sort(key=lambda x: x[1].get("timestamp", 0) if x[1] else 0)
-                    
+
                     # Delete the oldest 50 to make room
                     ids_to_delete = [p[0] for p in pairs[:50]]
                     col.delete(ids=ids_to_delete)
-                    
+
             # 4. Periodic Revalidation (24h centroid check logic hooked here later if needed)
             # Implemented natively by periodic pruning of old behaviors.
-            
+
         except Exception:
             pass
 
     @staticmethod
-    def _rolling_similarity(agent_id: str, org_id: str, text: str, window: int = 10) -> float:
+    def _rolling_similarity(
+        agent_id: str, org_id: str, text: str, window: int = 10
+    ) -> float:
         """Compare vs last N stored embeddings (profile-aware window)."""
         try:
             import chromadb
+
             from core.config.settings import get_settings as _gs
+
             s = _gs()
             client = chromadb.PersistentClient(path=s.CHROMA_PATH)
             col = client.get_or_create_collection(

@@ -3,6 +3,7 @@ core/listener.py — Async WebSocket event listener.
 Listens to Anvil (ws://127.0.0.1:8545) or Alchemy WebSocket for new transactions.
 Emits ChainEvent objects into the flow queue.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -21,12 +22,14 @@ __all__ = ["ChainListener"]
 logger = logging.getLogger("pramana.listener")
 
 # Subscription payload for eth_subscribe newPendingTransactions
-_SUBSCRIBE_PAYLOAD = json.dumps({
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "eth_subscribe",
-    "params": ["newPendingTransactions"],
-})
+_SUBSCRIBE_PAYLOAD = json.dumps(
+    {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_subscribe",
+        "params": ["newPendingTransactions"],
+    }
+)
 
 _FETCH_TX_PAYLOAD_TEMPLATE = {
     "jsonrpc": "2.0",
@@ -48,9 +51,9 @@ class ChainListener:
         on_event: Callable[[ChainEvent], Coroutine],
         org_id: str = "default",
     ) -> None:
-        self._on_event  = on_event
-        self._org_id    = org_id
-        self._running   = False
+        self._on_event = on_event
+        self._org_id = org_id
+        self._running = False
         self._retry_delay = 1.0
 
     async def start(self) -> None:
@@ -60,9 +63,13 @@ class ChainListener:
                 await self._connect_and_listen()
                 self._retry_delay = 1.0  # reset on clean disconnect
             except Exception as e:
-                logger.warning("Listener disconnected: %s. Retry in %ss", e, self._retry_delay)
+                logger.warning(
+                    "Listener disconnected: %s. Retry in %ss", e, self._retry_delay
+                )
                 await asyncio.sleep(self._retry_delay)
-                self._retry_delay = min(self._retry_delay * 2, 60.0)  # exponential backoff
+                self._retry_delay = min(
+                    self._retry_delay * 2, 60.0
+                )  # exponential backoff
 
     def stop(self) -> None:
         self._running = False
@@ -104,7 +111,7 @@ class ChainListener:
             if not tx:
                 return None
             gas_price = int(tx.get("gasPrice", "0x0"), 16)
-            value     = int(tx.get("value", "0x0"), 16)
+            value = int(tx.get("value", "0x0"), 16)
             return ChainEvent(
                 agent_id=tx.get("from", "0x") or "0x",
                 org_id=self._org_id,

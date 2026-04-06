@@ -4,6 +4,7 @@ Pass 1: Chroma cosine similarity vs baseline embeddings. <100ms.
 Pass 2 (borderline 0.65–0.80): DuckDB historical success rate lookup.
 NO Groq calls at L1. Only pattern-based + vector similarity.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -59,7 +60,9 @@ class HallucinationAgent(BaseL1Agent):
                 pass_count=0,
             )
 
-        similarity = self._chroma_similarity(event.agent_id, event.org_id, event.calldata or "")
+        similarity = self._chroma_similarity(
+            event.agent_id, event.org_id, event.calldata or ""
+        )
         if similarity is None:
             # Fix 9: Cold-start now flags conservatively instead of passing.
             # New agents with no baseline should be escalated, not trusted.
@@ -67,8 +70,8 @@ class HallucinationAgent(BaseL1Agent):
             meta["warmup"] = True
             return self._make_result(
                 self.name,
-                True,   # was: False — silently passed new agents
-                0.50,   # was: 0.25 — too permissive
+                True,  # was: False — silently passed new agents
+                0.50,  # was: 0.25 — too permissive
                 "warmup_period: no vector baseline established",
                 meta,
                 pass_count=1,
@@ -80,28 +83,41 @@ class HallucinationAgent(BaseL1Agent):
         if similarity < s.HALLUC_SCORE_THRESHOLD:
             deviation = 1.0 - similarity
             score = max(score, min(deviation * 1.2, 1.0))
-            issues.append(f"output cosine similarity {similarity:.3f} < threshold {s.HALLUC_SCORE_THRESHOLD}")
+            issues.append(
+                f"output cosine similarity {similarity:.3f} < threshold {s.HALLUC_SCORE_THRESHOLD}"
+            )
 
         flagged = score >= 0.50
         reason = "; ".join(issues) if issues else "hallucination nominal"
         return self._make_result(self.name, flagged, score, reason, meta)
 
-    def verify(self, event: ChainEvent, state: PramanaState, first: L1Result) -> L1Result:
+    def verify(
+        self, event: ChainEvent, state: PramanaState, first: L1Result
+    ) -> L1Result:
         """Second pass: look up historical success rate for this action type."""
         meta = dict(first.metadata)
-        success_rate = self._historical_success_rate(event.agent_id, event.org_id, event.action)
+        success_rate = self._historical_success_rate(
+            event.agent_id, event.org_id, event.action
+        )
         meta["historical_success_rate"] = round(success_rate, 3)
 
         # Low historical success rate for this specific action reinforces flag
         if success_rate < 0.50:
             return self._make_result(
-                self.name, True,
+                self.name,
+                True,
                 min(first.score + (0.5 - success_rate) * 0.3, 1.0),
-                first.reason + f" (hist success {success_rate:.0%})", meta, pass_count=2
+                first.reason + f" (hist success {success_rate:.0%})",
+                meta,
+                pass_count=2,
             )
         return self._make_result(
-            self.name, first.flagged, max(first.score - 0.05, 0.0),
-            first.reason + " (hist ok)", meta, pass_count=2
+            self.name,
+            first.flagged,
+            max(first.score - 0.05, 0.0),
+            first.reason + " (hist ok)",
+            meta,
+            pass_count=2,
         )
 
     # ── Internals ─────────────────────────────────────────────────────────────
@@ -110,12 +126,15 @@ class HallucinationAgent(BaseL1Agent):
     def _chroma_similarity(agent_id: str, org_id: str, text: str) -> float | None:
         """Query ChromaDB for cosine similarity vs baseline corpus. Returns None when unavailable."""
         from utils.cache import EMBEDDING_CACHE
+
         cache_key = f"{agent_id}:{hash(text[:256])}"
         if cache_key in EMBEDDING_CACHE:
             return EMBEDDING_CACHE[cache_key]
         try:
             import chromadb
+
             from core.config.settings import get_settings as _gs
+
             s = _gs()
             client = chromadb.PersistentClient(path=s.CHROMA_PATH)
             col = client.get_or_create_collection(
@@ -138,6 +157,7 @@ class HallucinationAgent(BaseL1Agent):
     def _historical_success_rate(agent_addr: str, org_id: str, action: str) -> float:
         try:
             from core.db import get_duck_conn
+
             with get_duck_conn() as conn:
                 row = conn.execute(
                     """

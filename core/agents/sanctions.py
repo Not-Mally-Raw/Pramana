@@ -5,18 +5,21 @@ Uses CalldataParser to extract all deeply nested addresses from an
 Agent's proposed transaction, checking them against a local SQLite 
 replica of the OFAC SDN list. Any match results in an immediate 1.0 risk score.
 """
+
 from typing import Any
-from utils.models import ChainEvent, L1Result, PramanaState
+
 from core.agents.base import BaseL1Agent
-from core.parsers.calldata import decode_all_calls
 from core.db import is_sanctioned
+from core.parsers.calldata import decode_all_calls
+from utils.models import ChainEvent, L1Result, PramanaState
 
 __all__ = ["SanctionsAgent"]
+
 
 class SanctionsAgent(BaseL1Agent):
     name = "sanctions"
     max_latency_ms = 15.0  # Extremely fast SQLite primary key lookup
-    
+
     # We do not do a second pass for sanctions. It's binary.
     borderline_low = 2.0
     borderline_high = 2.0
@@ -30,16 +33,16 @@ class SanctionsAgent(BaseL1Agent):
         addresses_to_check = set()
         if event.agent_id:
             addresses_to_check.add(event.agent_id.lower())
-        
+
         # 2. Extract deep addresses using ABI CalldataParser
         calls = decode_all_calls(event.calldata or "")
         meta["decoded_calls"] = len(calls)
-        
+
         for c in calls:
             for addr in c.addresses:
                 if addr:
                     addresses_to_check.add(addr.lower())
-                    
+
         meta["unique_addresses_screened"] = len(addresses_to_check)
 
         # 3. Screen against local OFAC SQLite replica
@@ -47,9 +50,11 @@ class SanctionsAgent(BaseL1Agent):
         for addr in addresses_to_check:
             if is_sanctioned(addr):
                 sanctioned_hits.append(addr)
-                
+
         if sanctioned_hits:
-            issues.append(f"SANCTIONS HIT: {len(sanctioned_hits)} addresses on OFAC list")
+            issues.append(
+                f"SANCTIONS HIT: {len(sanctioned_hits)} addresses on OFAC list"
+            )
             meta["sanctioned_addresses"] = sanctioned_hits
             score = 1.0  # Hard stop
 

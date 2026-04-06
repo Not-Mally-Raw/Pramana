@@ -13,6 +13,7 @@ Key caches:
   4. OracleDataCache     — gas price / chain data (TTL=15s)
   5. EmbeddingCache      — Chroma embedding results (TTL=5min, LRU 512)
 """
+
 from __future__ import annotations
 
 import threading
@@ -24,7 +25,7 @@ from cachetools import LRUCache, TTLCache
 F = TypeVar("F", bound=Callable[..., Any])
 
 # ─── Routing Table ────────────────────────────────────────────────────────────
-# O(1) dict lookup, TTL=30s so dashboard changes apply within 30s.
+# O(1) dict lookup, TTL=30s so routing changes apply quickly.
 _routing_lock = threading.Lock()
 _routing_cache: TTLCache = TTLCache(maxsize=1, ttl=30)
 
@@ -52,7 +53,7 @@ def invalidate_routing_cache() -> None:
 # Key: (agent_id, action_hash) → L1Result / CouncilResult
 # TTL=300s (5 min), LRU max 256 entries, ~1KB each = ~256KB max.
 _llm_cache: TTLCache = TTLCache(maxsize=256, ttl=300)
-_llm_lock  = threading.Lock()
+_llm_lock = threading.Lock()
 
 
 def get_llm_cache(key: tuple) -> Any | None:
@@ -68,17 +69,17 @@ def set_llm_cache(key: tuple, value: Any) -> None:
 def llm_cache_stats() -> dict:
     with _llm_lock:
         return {
-            "size":    len(_llm_cache),
+            "size": len(_llm_cache),
             "maxsize": _llm_cache.maxsize,
-            "ttl":     _llm_cache.ttl,
-            "hits":    getattr(_llm_cache, "_hits", 0),
+            "ttl": _llm_cache.ttl,
+            "hits": getattr(_llm_cache, "_hits", 0),
         }
 
 
 # ─── Policy Cache ─────────────────────────────────────────────────────────────
 # Guard policies per (agent_id, org_id). TTL=60s.
 _policy_cache: TTLCache = TTLCache(maxsize=128, ttl=60)
-_policy_lock  = threading.Lock()
+_policy_lock = threading.Lock()
 
 
 def get_policy_cache(agent_id: str, org_id: str) -> Any | None:
@@ -99,7 +100,7 @@ def invalidate_policy_cache(agent_id: str, org_id: str) -> None:
 # ─── Oracle / Chain Data Cache ────────────────────────────────────────────────
 # Gas price, block number, chain latency. Short TTL=15s.
 _oracle_cache: TTLCache = TTLCache(maxsize=32, ttl=15)
-_oracle_lock  = threading.Lock()
+_oracle_lock = threading.Lock()
 
 
 def get_oracle_cache(key: str) -> Any | None:
@@ -115,7 +116,7 @@ def set_oracle_cache(key: str, value: Any) -> None:
 # ─── Embedding Cache ──────────────────────────────────────────────────────────
 # Chroma similarity results per (agent_id, text_hash). TTL=5min, LRU 512.
 # EMBEDDING_CACHE is exposed for direct dict-style access by agents.
-_embed_lock  = threading.Lock()
+_embed_lock = threading.Lock()
 EMBEDDING_CACHE: TTLCache = TTLCache(maxsize=512, ttl=300)
 
 
@@ -132,7 +133,7 @@ def set_embed_cache(agent_id: str, text_hash: str, score: float) -> None:
 # ─── Rate Limit Tracker ───────────────────────────────────────────────────────
 # Count Groq calls per minute to stay under 25 RPM (buffer below 30 RPM free limit).
 _groq_calls: list[float] = []
-_groq_lock  = threading.Lock()
+_groq_lock = threading.Lock()
 GROQ_RPM_LIMIT = 25
 
 
@@ -158,6 +159,7 @@ def groq_calls_last_minute() -> int:
 
 # ─── Generic TTL Decorator ────────────────────────────────────────────────────
 
+
 def ttl_cached(ttl_seconds: int = 60, maxsize: int = 128):
     """
     Decorator for caching function results with TTL.
@@ -177,6 +179,7 @@ def ttl_cached(ttl_seconds: int = 60, maxsize: int = 128):
             with lock:
                 cache[key] = result
             return result
+
         wrapper.__wrapped__ = func  # type: ignore[attr-defined]
         return wrapper  # type: ignore[return-value]
 

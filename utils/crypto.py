@@ -4,6 +4,7 @@ utils/crypto.py — Hashing and encoding utilities.
 All functions are pure, stateless, and side-effect-free.
 Used by TraceDAG.finalize(), Guardian policy hashing, and SDK trace capture.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -11,8 +12,8 @@ import json
 import struct
 from typing import Any
 
-
 # ─── SHA-256 ──────────────────────────────────────────────────────────────────
+
 
 def sha256_hex(data: str | bytes) -> str:
     """SHA-256 of string or bytes. Returns 64-char hex string."""
@@ -38,6 +39,7 @@ def sha256_json(obj: Any) -> str:
 
 # ─── keccak256 (pure Python, no web3 needed) ──────────────────────────────────
 
+
 def keccak256_hex(data: str | bytes) -> str:
     """
     keccak256 used by Solidity for event topic hashing.
@@ -58,6 +60,7 @@ def keccak256_hex(data: str | bytes) -> str:
 
 # ─── ABI Encoding helpers ─────────────────────────────────────────────────────
 
+
 def encode_bytes32(hex_str: str) -> bytes:
     """Convert 64-char hex to 32 bytes (for on-chain calls)."""
     s = hex_str.removeprefix("0x")
@@ -73,6 +76,7 @@ def hex_to_bytes32_param(hex_str: str) -> str:
 
 
 # ─── Fingerprinting ───────────────────────────────────────────────────────────
+
 
 def action_fingerprint(agent_id: str, action: str, calldata: str) -> str:
     """
@@ -104,6 +108,7 @@ def eth_address_to_uint256(address: str) -> int:
 
 # ─── Merkle Root (lightweight, for batch SBT updates) ────────────────────────
 
+
 def merkle_root(leaves: list[str]) -> str:
     """
     Compute a simple binary Merkle root from a list of hex strings.
@@ -115,7 +120,7 @@ def merkle_root(leaves: list[str]) -> str:
     nodes = [bytes.fromhex(leaf.removeprefix("0x").zfill(64)) for leaf in leaves]
     while len(nodes) > 1:
         if len(nodes) % 2 == 1:
-            nodes.append(nodes[-1])   # duplicate last leaf if odd
+            nodes.append(nodes[-1])  # duplicate last leaf if odd
         nodes = [
             hashlib.sha256(nodes[i] + nodes[i + 1]).digest()
             for i in range(0, len(nodes), 2)

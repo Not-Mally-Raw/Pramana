@@ -1,0 +1,164 @@
+version: '3.8'
+
+services:
+  # Anvil local Ethereum node (development only)
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: pramana-anvil
+    command: anvil --host 0.0.0.0
+    ports:
+      - "8545:8545"
+    networks:
+      - pramana-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8545"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    profiles:
+      - dev
+
+  # FastAPI Backend
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: pramana-api
+    ports:
+      - "8000:8000"
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      JWT_SECRET: ${JWT_SECRET}
+      ATTESTATION_HMAC_SECRET: ${ATTESTATION_HMAC_SECRET}
+      NETWORK: ${NETWORK:-anvil}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DEBUG: ${DEBUG:-false}
+      PYTHORUNBUFFERED: 1
+    volumes:
+      - ./data:/app/data
+      - ./core:/app/core
+      - ./utils:/app/utils
+    networks:
+      - pramana-network
+    depends_on:
+      - anvil
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    profiles:
+      - dev
+      - prod
+
+  # Next.js Frontend (additional service, optional)
+  frontend:
+    image: node:18-alpine
+    container_name: pramana-frontend
+    working_dir: /app/frontend
+    command: npm run start
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app/frontend
+      - /app/frontend/node_modules
+      - /app/frontend/.next
+    environment:
+      NEXT_PUBLIC_API_URL: http://api:8000
+    networks:
+      - pramana-network
+    depends_on:
+      - api
+    restart: unless-stopped
+    profiles:
+      - dev
+
+  # PostgreSQL for optional persistent storage
+  postgres:
+    image: postgres:15-alpine
+    container_name: pramana-postgres
+    environment:
+      POSTGRES_USER: pramana
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pramana}
+      POSTGRES_DB: pramana
+    volumes:
+      - pramana-postgres-data:/var/lib/postgresql/data
+    networks:
+      - pramana-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pramana"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    profiles:
+      - prod
+
+  # Redis for caching (optional)
+  redis:
+    image: redis:7-alpine
+    container_name: pramana-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - pramana-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    profiles:
+      - prod
+
+  # Prometheus for metrics (optional)
+  prometheus:
+    image: prom/prometheus
+    container_name: pramana-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - pramana-prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - pramana-network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  # Grafana for dashboards (optional)
+  grafana:
+    image: grafana/grafana
+    container_name: pramana-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - pramana-grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3001:3000"
+    networks:
+      - pramana-network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+networks:
+  pramana-network:
+    driver: bridge
+
+volumes:
+  pramana-postgres-data:
+  pramana-prometheus-data:
+  pramana-grafana-data:
+
+# Usage:
+# Development (with Anvil):  docker-compose --profile dev up
+# Production:                docker-compose --profile prod up
+# Monitoring:                docker-compose --profile monitoring up
+# All:                       docker-compose --profile dev --profile prod --profile monitoring up

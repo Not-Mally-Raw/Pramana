@@ -5,6 +5,7 @@
 
 import axios from "axios";
 import type { PramanaConfig, TraceDAGJSON, TraceNode } from "./types";
+import { buildPramanaHeaders } from "./http";
 
 export class CoTCapture {
   private nodes: TraceNode[] = [];
@@ -52,7 +53,7 @@ export class CoTCapture {
           network: "elizaos",
         },
         {
-          headers: { "X-Org-Id": this.config.orgId },
+          headers: buildPramanaHeaders(this.config),
           timeout: 5000,
         }
       );

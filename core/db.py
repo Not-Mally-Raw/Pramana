@@ -2,6 +2,7 @@
 core/db.py — SQLite (state/events) + DuckDB (analytics) setup.
 All tables include org_id for multi-tenancy. LRU eviction to 10K rows per org.
 """
+
 from __future__ import annotations
 
 import json
@@ -121,6 +122,7 @@ CREATE TABLE IF NOT EXISTS bundler_registry (
     org_id            TEXT NOT NULL,
     active            INTEGER DEFAULT 1,
     fallback_policy   TEXT DEFAULT 'ESCALATE',
+    on_pramana_degraded TEXT DEFAULT 'ESCALATE',
     supported_chains  TEXT,
     webhook_url       TEXT,
     registered_at     TEXT
@@ -236,6 +238,7 @@ CREATE INDEX IF NOT EXISTS idx_rate_limit_org_ts ON rate_limit_windows(org_id, t
 def _ensure_dir(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
+
 def is_sanctioned(address: str) -> bool:
     """O(1) local sanctions check."""
     if not address:
@@ -244,7 +247,7 @@ def is_sanctioned(address: str) -> bool:
         with get_sqlite_conn() as conn:
             row = conn.execute(
                 "SELECT 1 FROM sanctions_list WHERE lower(address) = ?",
-                (address.lower(),)
+                (address.lower(),),
             ).fetchone()
         return bool(row)
     except Exception:
@@ -272,6 +275,7 @@ def _apply_sqlite_migrations(conn: sqlite3.Connection) -> None:
         ("lifecycle_transitions", "capital_at_risk_usd", "REAL"),
         ("open_positions", "is_finalized", "INTEGER DEFAULT 0"),
         ("bundler_registry", "active", "INTEGER DEFAULT 1"),
+        ("bundler_registry", "on_pramana_degraded", "TEXT DEFAULT 'ESCALATE'"),
         ("bundler_registry", "supported_chains", "TEXT"),
         ("bundler_registry", "webhook_url", "TEXT"),
         ("bundler_registry", "registered_at", "TEXT"),
@@ -308,7 +312,11 @@ def _seed_routing_rules(conn: sqlite3.Connection) -> None:
             return
 
         data = json.loads(rules_path.read_text(encoding="utf-8"))
-        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+        now = (
+            __import__("datetime")
+            .datetime.now(__import__("datetime").timezone.utc)
+            .isoformat()
+        )
 
         for section in ("escalation_rules", "pass_rules"):
             for rule_key, rule in (data.get(section, {}) or {}).items():
@@ -367,6 +375,7 @@ def evict_old_rows(org_id: str, max_rows: int = 10_000) -> None:
 
 # ── CRUD helpers ──────────────────────────────────────────────────────────────
 
+
 def upsert_agent(
     agent_addr: str,
     org_id: str,
@@ -377,6 +386,7 @@ def upsert_agent(
     metadata: dict | None = None,
 ) -> None:
     from datetime import datetime, timezone
+
     now = datetime.now(timezone.utc).isoformat()
     with get_sqlite_conn() as conn:
         conn.execute(
@@ -387,7 +397,17 @@ def upsert_agent(
                 did=excluded.did, agent_profile=excluded.agent_profile, risk_tier=excluded.risk_tier,
                 paused=excluded.paused, metadata=excluded.metadata, updated_at=excluded.updated_at
             """,
-            (agent_addr, org_id, did, agent_profile, risk_tier, int(paused), json.dumps(metadata or {}), now, now),
+            (
+                agent_addr,
+                org_id,
+                did,
+                agent_profile,
+                risk_tier,
+                int(paused),
+                json.dumps(metadata or {}),
+                now,
+                now,
+            ),
         )
 
 
@@ -396,13 +416,45 @@ def get_agent_profile(agent_addr: str, org_id: str) -> str:
     with get_sqlite_conn() as conn:
         row = conn.execute(
             "SELECT agent_profile FROM agents WHERE agent_addr=? AND org_id=?",
-            (agent_addr, org_id)
+            (agent_addr, org_id),
         ).fetchone()
     return row[0] if row else "generic"
 
 
 def insert_event(event_dict: dict) -> None:
     from datetime import datetime, timezone
+
+    def _to_created_at_utc(value: object | None) -> str:
+        """Normalize event timestamps for SQLite window queries.
+
+        Stored format is UTC `YYYY-MM-DD HH:MM:SS` so string comparisons and
+        sqlite `datetime()` operations behave predictably.
+        """
+        dt: datetime
+
+        if value is None:
+            dt = datetime.now(timezone.utc)
+        elif isinstance(value, (int, float)):
+            dt = datetime.fromtimestamp(float(value), timezone.utc)
+        elif isinstance(value, str):
+            # Try unix seconds first, then ISO-8601.
+            try:
+                dt = datetime.fromtimestamp(float(value), timezone.utc)
+            except Exception:
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    dt = (
+                        parsed.replace(tzinfo=timezone.utc)
+                        if parsed.tzinfo is None
+                        else parsed.astimezone(timezone.utc)
+                    )
+                except Exception:
+                    dt = datetime.now(timezone.utc)
+        else:
+            dt = datetime.now(timezone.utc)
+
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
     with get_sqlite_conn() as conn:
         conn.execute(
             """
@@ -418,7 +470,7 @@ def insert_event(event_dict: dict) -> None:
                 str(event_dict.get("value_wei", 0)),
                 str(event_dict.get("gas_price", 0)),
                 event_dict.get("network", "anvil"),
-                event_dict.get("timestamp", datetime.now(timezone.utc).isoformat()),
+                _to_created_at_utc(event_dict.get("timestamp")),
             ),
         )
 
@@ -434,6 +486,7 @@ def insert_trace(
     council_action: str,
 ) -> None:
     from datetime import datetime, timezone
+
     with get_sqlite_conn() as conn:
         conn.execute(
             """
@@ -441,8 +494,17 @@ def insert_trace(
               (flow_id, org_id, agent_addr, trace_hash, dag_json, flag_count, risk_score, council_action, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (flow_id, org_id, agent_addr, trace_hash, dag_json, flag_count, risk_score,
-             council_action, datetime.now(timezone.utc).isoformat()),
+            (
+                flow_id,
+                org_id,
+                agent_addr,
+                trace_hash,
+                dag_json,
+                flag_count,
+                risk_score,
+                council_action,
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
 
 
@@ -484,6 +546,7 @@ def upsert_policy(
     version: int = 1,
 ) -> None:
     from datetime import datetime, timezone
+
     now = datetime.now(timezone.utc).isoformat()
     with get_sqlite_conn() as conn:
         conn.execute(
@@ -504,11 +567,21 @@ def get_routing_table() -> dict:
         rows = conn.execute(
             "SELECT rule_key, condition, action, priority FROM routing_table WHERE enabled=1 ORDER BY priority DESC"
         ).fetchall()
-    return {r["rule_key"]: {"condition": r["condition"], "action": r["action"], "priority": r["priority"]} for r in rows}
+    return {
+        r["rule_key"]: {
+            "condition": r["condition"],
+            "action": r["action"],
+            "priority": r["priority"],
+        }
+        for r in rows
+    }
 
 
-def upsert_routing_rule(rule_key: str, condition: str, action: str, priority: int = 5) -> None:
+def upsert_routing_rule(
+    rule_key: str, condition: str, action: str, priority: int = 5
+) -> None:
     from datetime import datetime, timezone
+
     with get_sqlite_conn() as conn:
         conn.execute(
             """
@@ -518,7 +591,13 @@ def upsert_routing_rule(rule_key: str, condition: str, action: str, priority: in
                 condition=excluded.condition, action=excluded.action,
                 priority=excluded.priority, updated_at=excluded.updated_at
             """,
-            (rule_key, condition, action, priority, datetime.now(timezone.utc).isoformat()),
+            (
+                rule_key,
+                condition,
+                action,
+                priority,
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
 
 
@@ -592,7 +671,15 @@ def query_reputation_window(agent_addr: str, org_id: str, days: int = 30) -> lis
             """,
             [agent_addr, org_id, days],
         ).fetchall()
-    return [{"recorded_at": r[0], "composite": r[1], "success_rate": r[2], "halluc_rate": r[3]} for r in rows]
+    return [
+        {
+            "recorded_at": r[0],
+            "composite": r[1],
+            "success_rate": r[2],
+            "halluc_rate": r[3],
+        }
+        for r in rows
+    ]
 
 
 def insert_agent_metric(

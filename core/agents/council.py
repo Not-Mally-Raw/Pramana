@@ -4,6 +4,7 @@ Implements weighted majority voting:
   judge_0 (temp=0.0) weight=2, judge_1 (temp=0.5) weight=1, judge_2 (temp=1.0) weight=1.
 Falls back to deterministic rule-based scoring if Groq is unavailable.
 """
+
 from __future__ import annotations
 
 import json
@@ -55,7 +56,9 @@ class CouncilAgent:
             else:
                 vote = self._deterministic_vote(judge_id, weight, state)
             votes.append(vote)
-            time.sleep(state.settings.COUNCIL_DELAY_S if hasattr(state, "settings") else 2.0)
+            time.sleep(
+                state.settings.COUNCIL_DELAY_S if hasattr(state, "settings") else 2.0
+            )
 
         return self._tally_votes(votes, state)
 
@@ -66,25 +69,31 @@ class CouncilAgent:
         l1_summary = []
         for r in state.l1_results:
             if r.flagged:
-                l1_summary.append(f"  - {r.agent_name}: FLAGGED (score={r.score:.2f}, {r.reason})")
+                l1_summary.append(
+                    f"  - {r.agent_name}: FLAGGED (score={r.score:.2f}, {r.reason})"
+                )
         evidence = {
             "event": {
                 "agent_id": state.event.agent_id if state.event else "unknown",
-                "action":   state.event.action   if state.event else "unknown",
-                "network":  state.event.network  if state.event else "anvil",
+                "action": state.event.action if state.event else "unknown",
+                "network": state.event.network if state.event else "anvil",
             },
-            "flag_count":    state.flag_count,
-            "risk_score":    state.risk_score,
+            "flag_count": state.flag_count,
+            "risk_score": state.risk_score,
             "degraded_mode": str(state.degraded_mode),
-            "l1_flags":      l1_summary,
-            "trace_hash":    state.trace_hash,
+            "l1_flags": l1_summary,
+            "trace_hash": state.trace_hash,
         }
         return json.dumps(evidence, indent=2)
 
     @staticmethod
-    def _call_groq(judge_id: str, temperature: float, weight: float, evidence: str) -> CouncilVote:
+    def _call_groq(
+        judge_id: str, temperature: float, weight: float, evidence: str
+    ) -> CouncilVote:
         from groq import Groq
+
         from core.config.settings import get_settings
+
         s = get_settings()
         client = Groq(api_key=s.GROQ_API_KEY)
         try:
@@ -93,7 +102,7 @@ class CouncilAgent:
                 model=s.GROQ_MODEL_COUNCIL,
                 messages=[
                     {"role": "system", "content": _COUNCIL_SYSTEM_PROMPT},
-                    {"role": "user",   "content": f"Evidence:\n{evidence}"},
+                    {"role": "user", "content": f"Evidence:\n{evidence}"},
                 ],
                 temperature=temperature,
                 max_tokens=s.GROQ_MAX_TOKENS,
@@ -132,11 +141,15 @@ class CouncilAgent:
             )
 
     @staticmethod
-    def _deterministic_vote(judge_id: str, weight: float, state: PramanaState) -> CouncilVote:
+    def _deterministic_vote(
+        judge_id: str, weight: float, state: PramanaState
+    ) -> CouncilVote:
         """Rule-based fallback when Groq rate limit is hit."""
         risk = state.risk_score
         approved = risk < 0.40 and state.flag_count == 0
-        action = "allow" if approved else ("emergency_stop" if risk >= 0.85 else "pause")
+        action = (
+            "allow" if approved else ("emergency_stop" if risk >= 0.85 else "pause")
+        )
         return CouncilVote(
             judge_id=judge_id,
             approved=approved,
@@ -173,6 +186,7 @@ class CouncilAgent:
         reason = " | ".join(v.reason[:60] for v in votes)[:300]
 
         from utils.models import FlowAction
+
         action_map = {
             "allow": FlowAction.PASS,
             "pause": FlowAction.PAUSE,

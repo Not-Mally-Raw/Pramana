@@ -3,15 +3,14 @@ core/crews/intervention.py — Level-2 Intervention Crew.
 Invoked when escalation threshold is met.
 Runs: Council deliberation → Recovery (if needed) → Reputation update.
 """
+
 from __future__ import annotations
-
-from utils.models import CouncilResult, FlowAction, PramanaState
-
-from core.config.settings import get_settings
 
 from core.agents.council import CouncilAgent
 from core.agents.recovery import RecoveryAgent
 from core.agents.reputation import ReputationAgent
+from core.config.settings import get_settings
+from utils.models import CouncilResult, FlowAction, PramanaState
 
 __all__ = ["InterventionCrew"]
 
@@ -20,8 +19,8 @@ class InterventionCrew:
     """Level-2 crew: Council + Recovery + Reputation. Invoked on escalation."""
 
     def __init__(self) -> None:
-        self._council    = CouncilAgent()
-        self._recovery   = RecoveryAgent()
+        self._council = CouncilAgent()
+        self._recovery = RecoveryAgent()
         self._reputation = ReputationAgent()
 
     def kickoff(self, state: PramanaState) -> CouncilResult:
@@ -29,7 +28,10 @@ class InterventionCrew:
         council_result = self._council.deliberate(state)
 
         # ── 2. Recovery: if any judge flagged groq_rate_limit pattern ───────
-        if all(v.model == "fallback" or v.model == "deterministic" for v in council_result.votes):
+        if all(
+            v.model == "fallback" or v.model == "deterministic"
+            for v in council_result.votes
+        ):
             self._recovery.execute("groq_rate_limit", state)
 
         # ── 3. On-chain action based on council verdict ──────────────────────
@@ -46,28 +48,35 @@ class InterventionCrew:
     def _on_chain_pause(state: PramanaState, council_result: CouncilResult) -> None:
         """Write pause + council decision to Orchestrator contract."""
         try:
-            from core.config.settings import get_settings
-            from web3 import Web3
             import json
+
+            from web3 import Web3
+
+            from core.config.settings import get_settings
 
             s = get_settings()
             if not s.ORCHESTRATOR_ADDR or not s.DEPLOYER_KEY or not state.event:
                 return
 
             w3 = Web3(Web3.HTTPProvider(s.active_rpc))
-            abi = json.loads("""[
+            abi = json.loads(
+                """[
               {"inputs":[{"name":"agentId","type":"uint256"},{"name":"reason","type":"string"}],
                "name":"pauseAgent","outputs":[],"stateMutability":"nonpayable","type":"function"},
               {"inputs":[{"name":"agentId","type":"uint256"},{"name":"approved","type":"bool"},
                {"name":"riskScore","type":"uint8"},{"name":"reason","type":"string"}],
                "name":"recordCouncilDecision","outputs":[],"stateMutability":"nonpayable","type":"function"}
-            ]""")
-            contract = w3.eth.contract(address=s.ORCHESTRATOR_ADDR, abi=abi)
+            ]"""
+            )
+            contract = w3.eth.contract(
+                address=w3.to_checksum_address(s.ORCHESTRATOR_ADDR), abi=abi
+            )
             acct = w3.eth.account.from_key(s.DEPLOYER_KEY)
             nonce = w3.eth.get_transaction_count(acct.address)
 
             # recordCouncilDecision auto-pauses if !approved && risk >= 70
             from utils.crypto import eth_address_to_uint256
+
             agent_id = eth_address_to_uint256(state.event.agent_id)
             risk_int = min(int(council_result.risk_score * 100), 100)
             tx = contract.functions.recordCouncilDecision(
@@ -90,8 +99,9 @@ class MonitoringAndInterventionCrew:
 
     def __init__(self) -> None:
         from core.crews.monitoring import MonitoringCrew
-        self._monitoring    = MonitoringCrew()
-        self._intervention  = InterventionCrew()
+
+        self._monitoring = MonitoringCrew()
+        self._intervention = InterventionCrew()
 
     def run_monitoring(self, state: PramanaState) -> PramanaState:
         if not state.event:
@@ -141,7 +151,11 @@ class MonitoringAndInterventionCrew:
 
         base = (weighted_sum / total_w) if total_w > 0 else 0.0
         flag_density = flagged_count / max(len(results), 1)
-        density_bonus = min(flag_density * s.RISK_FLAG_DENSITY_BONUS, s.RISK_FLAG_DENSITY_BONUS)
-        uncertainty = (skipped_count / max(len(results), 1)) * s.RISK_UNCERTAINTY_PENALTY
+        density_bonus = min(
+            flag_density * s.RISK_FLAG_DENSITY_BONUS, s.RISK_FLAG_DENSITY_BONUS
+        )
+        uncertainty = (
+            skipped_count / max(len(results), 1)
+        ) * s.RISK_UNCERTAINTY_PENALTY
         fused = base + density_bonus + uncertainty
         return max(0.0, min(fused, 1.0))

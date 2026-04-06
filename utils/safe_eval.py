@@ -8,12 +8,12 @@ Supports a constrained subset:
 
 Disallows function calls, imports, comprehensions, subscripts, and all mutations.
 """
+
 from __future__ import annotations
 
 import ast
 from types import SimpleNamespace
 from typing import Any
-
 
 _ALLOWED_COMPARE_OPS = (
     ast.Gt,
@@ -97,7 +97,9 @@ def _eval_node(node: ast.AST, context: dict[str, Any]) -> Any:
     raise UnsafeExpressionError(f"Unsupported syntax: {type(node).__name__}")
 
 
-def evaluate_boolean_expression(expression: str, context: dict[str, Any] | SimpleNamespace) -> bool:
+def evaluate_boolean_expression(
+    expression: str, context: dict[str, Any] | SimpleNamespace
+) -> bool:
     """Safely evaluate a constrained boolean expression.
 
     Returns False if expression cannot be safely evaluated.

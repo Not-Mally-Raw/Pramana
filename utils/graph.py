@@ -9,10 +9,11 @@ Design:
   - Serialization format is stable (sorted nodes/edges) for reproducible hashes.
   - Max expected V=8, E=10 per flow → ~500 bytes serialized, negligible memory.
 """
+
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import time
 from typing import Any
 
@@ -26,9 +27,9 @@ class TraceDAG:
     """
 
     def __init__(self, flow_id: str, agent_id: str, org_id: str) -> None:
-        self.flow_id  = flow_id
+        self.flow_id = flow_id
         self.agent_id = agent_id
-        self.org_id   = org_id
+        self.org_id = org_id
         self._g: nx.DiGraph = nx.DiGraph()
         self._step = 0
         self._finalized: str | None = None  # cached hash after finalize()
@@ -74,9 +75,13 @@ class TraceDAG:
         elif payload is None:
             payload_str = ""
         else:
-            payload_str = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+            payload_str = json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), default=str
+            )
 
-        payload_hash = hashlib.sha256(payload_str.encode()).hexdigest() if payload_str else ""
+        payload_hash = (
+            hashlib.sha256(payload_str.encode()).hexdigest() if payload_str else ""
+        )
         self._g.add_edge(src, dst, data_hash=payload_hash)
 
     def _resolve_node_ref(self, node_ref: str) -> str:
@@ -119,16 +124,14 @@ class TraceDAG:
         }
         edges = [
             {"from": u, "to": v, "data_hash": d.get("data_hash", "")}
-            for u, v, d in sorted(
-                self._g.edges(data=True), key=lambda x: (x[0], x[1])
-            )
+            for u, v, d in sorted(self._g.edges(data=True), key=lambda x: (x[0], x[1]))
         ]
         return {
-            "flow_id":  self.flow_id,
+            "flow_id": self.flow_id,
             "agent_id": self.agent_id,
-            "org_id":   self.org_id,
-            "nodes":    nodes,
-            "edges":    edges,
+            "org_id": self.org_id,
+            "nodes": nodes,
+            "edges": edges,
         }
 
     def to_json(self) -> str:
@@ -159,19 +162,14 @@ class TraceDAG:
 
     def flagged_nodes(self) -> list[str]:
         """O(V) — return node_ids where flagged=True."""
-        return [
-            nid for nid, attrs in self._g.nodes(data=True) if attrs.get("flagged")
-        ]
+        return [nid for nid, attrs in self._g.nodes(data=True) if attrs.get("flagged")]
 
     def flag_count(self) -> int:
         return len(self.flagged_nodes())
 
     def average_score(self) -> float:
         """Average agent score across all nodes. O(V)."""
-        scores = [
-            attrs.get("score", 0.0)
-            for _, attrs in self._g.nodes(data=True)
-        ]
+        scores = [attrs.get("score", 0.0) for _, attrs in self._g.nodes(data=True)]
         return sum(scores) / len(scores) if scores else 0.0
 
     def ancestors_of(self, node_id: str) -> list[str]:
