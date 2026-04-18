@@ -22,6 +22,7 @@ __all__ = [
     "init_duckdb",
     "evict_old_rows",
     "upsert_agent",
+    "set_agent_paused",
     "insert_event",
     "insert_trace",
     "upsert_policy",
@@ -411,6 +412,23 @@ def upsert_agent(
         )
 
 
+def set_agent_paused(agent_addr: str, org_id: str, paused: bool) -> None:
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    with get_sqlite_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO agents (agent_addr, org_id, paused, registered_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(agent_addr, org_id) DO UPDATE SET
+                paused=excluded.paused,
+                updated_at=excluded.updated_at
+            """,
+            (agent_addr, org_id, int(paused), now, now),
+        )
+
+
 def get_agent_profile(agent_addr: str, org_id: str) -> str:
     """Fetch agent's profile, default to 'generic'."""
     with get_sqlite_conn() as conn:
@@ -424,36 +442,42 @@ def get_agent_profile(agent_addr: str, org_id: str) -> str:
 def insert_event(event_dict: dict) -> None:
     from datetime import datetime, timezone
 
-    def _to_created_at_utc(value: object | None) -> str:
+    def _to_created_at_utc(raw: object) -> str:
         """Normalize event timestamps for SQLite window queries.
 
         Stored format is UTC `YYYY-MM-DD HH:MM:SS` so string comparisons and
         sqlite `datetime()` operations behave predictably.
         """
+
         dt: datetime
 
-        if value is None:
+        if raw is None:
             dt = datetime.now(timezone.utc)
-        elif isinstance(value, (int, float)):
-            dt = datetime.fromtimestamp(float(value), timezone.utc)
-        elif isinstance(value, str):
-            # Try unix seconds first, then ISO-8601.
-            try:
-                dt = datetime.fromtimestamp(float(value), timezone.utc)
-            except Exception:
+        elif isinstance(raw, (int, float)):
+            dt = datetime.fromtimestamp(float(raw), timezone.utc)
+        elif isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                dt = datetime.now(timezone.utc)
+            else:
+                # Try unix seconds first, then ISO-8601.
                 try:
-                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                    dt = (
-                        parsed.replace(tzinfo=timezone.utc)
-                        if parsed.tzinfo is None
-                        else parsed.astimezone(timezone.utc)
-                    )
-                except Exception:
-                    dt = datetime.now(timezone.utc)
+                    dt = datetime.fromtimestamp(float(text), timezone.utc)
+                except ValueError:
+                    try:
+                        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                        if parsed.tzinfo is None:
+                            dt = parsed.replace(tzinfo=timezone.utc)
+                        else:
+                            dt = parsed.astimezone(timezone.utc)
+                    except ValueError:
+                        dt = datetime.now(timezone.utc)
         else:
             dt = datetime.now(timezone.utc)
 
         return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    created_at = _to_created_at_utc(event_dict.get("timestamp"))
 
     with get_sqlite_conn() as conn:
         conn.execute(
@@ -470,7 +494,7 @@ def insert_event(event_dict: dict) -> None:
                 str(event_dict.get("value_wei", 0)),
                 str(event_dict.get("gas_price", 0)),
                 event_dict.get("network", "anvil"),
-                _to_created_at_utc(event_dict.get("timestamp")),
+                created_at,
             ),
         )
 
@@ -654,6 +678,8 @@ def get_duck_conn() -> Generator[duckdb.DuckDBPyConnection, None, None]:
     _ensure_dir(s.DUCKDB_PATH)
     conn = duckdb.connect(s.DUCKDB_PATH)
     try:
+        # Ensure schema exists for any code path that opens DuckDB directly.
+        conn.execute(_DUCKDB_SCHEMA)
         yield conn
     finally:
         conn.close()
@@ -695,6 +721,8 @@ def insert_agent_metric(
 
     window_ts = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     with get_duck_conn() as conn:
+        # Keep writes resilient when analytics DB exists but schema wasn't initialized.
+        conn.execute(_DUCKDB_SCHEMA)
         current = conn.execute(
             """
             SELECT tx_count, flag_count, avg_gas_gwei, avg_risk, success_pct

@@ -49,21 +49,12 @@ class OperationsAgent(BaseL1Agent):
                 score, min(0.5 + (actions_per_min - action_loop_threshold) * 0.05, 1.0)
             )
 
-        # ── Balance drain detection by profile ────────────────────────────────
+        # NOTE: Balance drain detection requires an account balance reference.
+        # The config key is `BALANCE_DRAIN_PCT` (a percentage), but we do not
+        # have reliable on-chain balance context at L1. Avoid treating it as an
+        # absolute ETH threshold (that caused massive benign false positives).
         value_eth = event.value_wei / 1e18 if event.value_wei else 0.0
-        recent_eth_out = self._sum_recent_value(
-            event.agent_id, event.org_id, window_s=300, reference_ts=event.timestamp
-        )
-        balance_drain_threshold = thresholds["BALANCE_DRAIN_PCT"]
-        meta["recent_eth_out_5min"] = round(recent_eth_out, 6)
         meta["current_value_eth"] = round(value_eth, 6)
-        meta["balance_drain_threshold"] = balance_drain_threshold
-
-        if recent_eth_out > balance_drain_threshold:
-            issues.append(
-                f"balance drain: {recent_eth_out:.4f} ETH in 5min (threshold {balance_drain_threshold})"
-            )
-            score = max(score, 0.75)
 
         # ── Same action repeated (short loop variant) ──────────────────────
         repeat_count = self._count_same_action(
@@ -74,7 +65,7 @@ class OperationsAgent(BaseL1Agent):
             reference_ts=event.timestamp,
         )
         meta["action_repeat_2min"] = repeat_count
-        if repeat_count >= 3:
+        if repeat_count >= 5:
             issues.append(f"repeated action '{event.action}' {repeat_count}x in 2min")
             score = max(score, 0.65 + min(repeat_count * 0.05, 0.3))
 

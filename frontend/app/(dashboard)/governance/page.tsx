@@ -13,15 +13,17 @@ import {
   YAxis,
 } from "recharts";
 import { fetchRealtimeMetrics, fetchTraces } from "@/lib/api";
+import { useRuntimeConfigStore } from "@/stores/runtime";
 
 export default function GovernancePage() {
+  const orgId = useRuntimeConfigStore((state) => state.orgId);
   const tracesQuery = useQuery({
-    queryKey: ["governance-traces"],
+    queryKey: ["governance-traces", orgId],
     queryFn: () => fetchTraces(500),
   });
 
   const metricsQuery = useQuery({
-    queryKey: ["governance-metrics"],
+    queryKey: ["governance-metrics", orgId],
     queryFn: fetchRealtimeMetrics,
     refetchInterval: 20_000,
   });

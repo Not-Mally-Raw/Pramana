@@ -30,6 +30,9 @@ CANONICAL_ENTRY_POINTS = {
 class AAValidatorAgent(BaseL1Agent):
     name = "aa_validator"
     max_latency_ms = 40.0
+    # Paymaster/sender solvency is safety-critical; run deterministic verify()
+    # even when the first-pass score is not in the borderline band.
+    always_verify = True
 
     def check(self, event: ChainEvent, state: PramanaState) -> L1Result:
         uop = event.user_operation
@@ -74,7 +77,7 @@ class AAValidatorAgent(BaseL1Agent):
         meta["intent_value_wei"] = int(intended_value_wei)
         meta["intent_value_eth"] = round(float(intended_value_wei) / 1e18, 8)
         meta["intent_value_threshold_eth"] = float(
-            thresholds.get("BALANCE_DRAIN_PCT", s.BALANCE_DRAIN_PCT)
+            thresholds.get("AA_MAX_INTENT_VALUE_ETH", s.AA_MAX_INTENT_VALUE_ETH)
         )
 
         if decode_ok:
@@ -140,104 +143,105 @@ class AAValidatorAgent(BaseL1Agent):
         s = get_settings()
         meta = dict(first.metadata)
 
-        try:
-            from web3 import Web3
+        total_required_wei = (
+            uop.callGasLimit + uop.verificationGasLimit + uop.preVerificationGas
+        ) * uop.maxFeePerGas
 
-            # We connect to an active RPC via the config
-            w3 = Web3(Web3.HTTPProvider(s.ANVIL_RPC)) if "anvil" in s.NETWORK else None
+        has_paymaster = bool(uop.paymaster) or bool(uop.paymasterAndData)
+        target = uop.paymaster or (
+            uop.paymasterAndData[:42]
+            if uop.paymasterAndData and len(uop.paymasterAndData) >= 42
+            else None
+        )
 
-            if w3 and w3.is_connected():
-                ep_contract = w3.eth.contract(
-                    address=Web3.to_checksum_address(list(CANONICAL_ENTRY_POINTS)[0]),
-                    abi=[
-                        {
-                            "inputs": [
-                                {
-                                    "internalType": "address",
-                                    "name": "account",
-                                    "type": "address",
-                                }
-                            ],
-                            "name": "getDepositInfo",
-                            "outputs": [
-                                {
-                                    "components": [
-                                        {
-                                            "internalType": "uint112",
-                                            "name": "deposit",
-                                            "type": "uint112",
-                                        },
-                                        {
-                                            "internalType": "bool",
-                                            "name": "staked",
-                                            "type": "bool",
-                                        },
-                                        {
-                                            "internalType": "uint112",
-                                            "name": "stake",
-                                            "type": "uint112",
-                                        },
-                                        {
-                                            "internalType": "uint32",
-                                            "name": "unstakeDelaySec",
-                                            "type": "uint32",
-                                        },
-                                        {
-                                            "internalType": "uint48",
-                                            "name": "withdrawTime",
-                                            "type": "uint48",
-                                        },
-                                    ],
-                                    "internalType": "struct IEntryPoint.DepositInfo",
-                                    "name": "info",
-                                    "type": "tuple",
-                                }
-                            ],
-                            "stateMutability": "view",
-                            "type": "function",
-                        }
-                    ],
+        if not target:
+            # Self-paying account
+            target = uop.sender
+
+        now = time.time()
+        cache_hit = _paymaster_deposit_cache.get(target)
+        deposit: int | None = None
+
+        if cache_hit and now - cache_hit[1] < 60:
+            deposit = int(cache_hit[0])
+        else:
+            try:
+                from web3 import Web3
+
+                # We connect to an active RPC via the config
+                w3 = (
+                    Web3(Web3.HTTPProvider(s.ANVIL_RPC)) if "anvil" in s.NETWORK else None
                 )
 
-                total_required_wei = (
-                    uop.callGasLimit + uop.verificationGasLimit + uop.preVerificationGas
-                ) * uop.maxFeePerGas
+                if w3 and w3.is_connected():
+                    ep_contract = w3.eth.contract(
+                        address=Web3.to_checksum_address(list(CANONICAL_ENTRY_POINTS)[0]),
+                        abi=[
+                            {
+                                "inputs": [
+                                    {
+                                        "internalType": "address",
+                                        "name": "account",
+                                        "type": "address",
+                                    }
+                                ],
+                                "name": "getDepositInfo",
+                                "outputs": [
+                                    {
+                                        "components": [
+                                            {
+                                                "internalType": "uint112",
+                                                "name": "deposit",
+                                                "type": "uint112",
+                                            },
+                                            {
+                                                "internalType": "bool",
+                                                "name": "staked",
+                                                "type": "bool",
+                                            },
+                                            {
+                                                "internalType": "uint112",
+                                                "name": "stake",
+                                                "type": "uint112",
+                                            },
+                                            {
+                                                "internalType": "uint32",
+                                                "name": "unstakeDelaySec",
+                                                "type": "uint32",
+                                            },
+                                            {
+                                                "internalType": "uint48",
+                                                "name": "withdrawTime",
+                                                "type": "uint48",
+                                            },
+                                        ],
+                                        "internalType": "struct IEntryPoint.DepositInfo",
+                                        "name": "info",
+                                        "type": "tuple",
+                                    }
+                                ],
+                                "stateMutability": "view",
+                                "type": "function",
+                            }
+                        ],
+                    )
 
-                has_paymaster = bool(uop.paymaster) or bool(uop.paymasterAndData)
-                target = uop.paymaster or (
-                    uop.paymasterAndData[:42]
-                    if uop.paymasterAndData and len(uop.paymasterAndData) >= 42
-                    else None
-                )
-
-                if not target:
-                    # Self-paying account
-                    target = uop.sender
-
-                # Check TTL Cache first
-                cache_hit = _paymaster_deposit_cache.get(target)
-                now = time.time()
-                deposit = 0
-
-                if cache_hit and now - cache_hit[1] < 60:
-                    deposit = cache_hit[0]
-                else:
                     info = ep_contract.functions.getDepositInfo(
                         Web3.to_checksum_address(target)
                     ).call()
-                    deposit = info[0]  # deposit is uint112
+                    deposit = int(info[0])  # deposit is uint112
                     _paymaster_deposit_cache[target] = (deposit, now)
 
-                meta["sponsor_deposit_wei"] = deposit
+            except Exception as e:
+                logger.warning("AAValidator verify() node check failed: %s", e)
 
-                if deposit < total_required_wei:
-                    flags.append(
-                        f"undercollateralized {'paymaster' if has_paymaster else 'sender'} (deposit {deposit} < required {total_required_wei})"
-                    )
-                    max_score = max(max_score, 0.85)
-
-        except Exception as e:
-            logger.warning("AAValidator verify() node check failed: %s", e)
+        if deposit is not None:
+            meta["sponsor_deposit_wei"] = deposit
+            if deposit < total_required_wei:
+                flags.append(
+                    f"undercollateralized {'paymaster' if has_paymaster else 'sender'} (deposit {deposit} < required {total_required_wei})"
+                )
+                max_score = max(max_score, 0.85)
 
         if flags:
             reason = " | ".join(flags)

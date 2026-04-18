@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from contextlib import asynccontextmanager
@@ -28,6 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from core.agents.llm_provider import get_llm_provider
 from core.config.settings import get_settings
 from core.db import (
     get_duck_conn,
@@ -44,6 +46,7 @@ from core.listener import ChainListener
 from core.realtime import publish_event, realtime_hub
 from core.scheduler import start_scheduler, stop_scheduler
 from utils.crypto import policy_hash
+from utils.graph import TraceDAG
 from utils.models import (
     ApiResponse,
     ChainEvent,
@@ -152,11 +155,19 @@ def _check_rate_limit_sqlite(org_id: str, limit: int = 10) -> bool:
 @app.middleware("http")
 async def auth_and_rate_limit(request: Request, call_next):
     path = request.url.path
+    is_read_only_dashboard_route = request.method == "GET" and (
+        path == "/agents"
+        or path.startswith("/agents/")
+        or path == "/traces"
+        or path.startswith("/replay/")
+        or path.startswith("/decisions/")
+    )
     if (
         path.startswith("/health")
         or path.startswith("/docs")
         or path.startswith("/openapi.json")
         or path.startswith("/metrics/realtime")
+        or is_read_only_dashboard_route
     ):
         return await call_next(request)
 
@@ -214,7 +225,10 @@ def _safe_parse_iso(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
     except ValueError:
         return None
 
@@ -232,6 +246,21 @@ def _decision_kind(action: str | None) -> str:
     if "ESCALATE" in value:
         return "ESCALATE"
     return "PASS"
+
+
+def _fallback_models() -> dict[str, list[str]]:
+    """Conservative defaults used by the onboarding UI for quick validation."""
+    return {
+        "groq": [
+            "llama-3.1-8b-instant",
+            "llama-3.3-70b-versatile",
+            "mixtral-8x7b-32768",
+        ],
+        "cerebras": [
+            "llama-3.3-70b",
+            "llama-3.1-8b",
+        ],
+    }
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -267,6 +296,191 @@ async def health_detailed():
         checks["node"] = str(e)
 
     return ApiResponse(status="ok", data=checks)
+
+
+class ProviderValidationEntry(BaseModel):
+    slot: str
+    provider: str
+    api_key: str
+    model: str = ""
+    api_base: str = ""
+
+
+class ProviderValidationRequest(BaseModel):
+    entries: list[ProviderValidationEntry]
+
+
+@app.get("/health/platform-readiness", response_model=ApiResponse)
+async def health_platform_readiness(x_org_id: str | None = Header(None)):
+    org = _org_id(x_org_id)
+    try:
+        metrics = await metrics_realtime(x_org_id=org)
+        payload = metrics.data if isinstance(metrics.data, dict) else {}
+    except (sqlite3.Error, RuntimeError, ValueError) as exc:
+        payload = {
+            "api_status": "degraded",
+            "active_agents": 0,
+            "paused_agents": 0,
+            "decisions_per_min": 0,
+            "connected_stream_clients": 0,
+            "fleet": [],
+            "error": str(exc),
+        }
+
+    return ApiResponse(
+        status="ok",
+        data={
+            "org_id": org,
+            "api_status": payload.get("api_status", "down"),
+            "active_agents": int(payload.get("active_agents", 0) or 0),
+            "paused_agents": int(payload.get("paused_agents", 0) or 0),
+            "decisions_per_min": float(payload.get("decisions_per_min", 0.0) or 0.0),
+            "connected_stream_clients": int(payload.get("connected_stream_clients", 0) or 0),
+            "fleet_size": len(payload.get("fleet", []) or []),
+            "dag_stream_enabled": True,
+            "ready_for_live_demo": bool(
+                int(payload.get("active_agents", 0) or 0) > 0
+                and payload.get("api_status", "down") in {"healthy", "degraded"}
+            ),
+        },
+    )
+
+
+@app.get("/health/providers/status", response_model=ApiResponse)
+async def health_providers_status():
+    models = _fallback_models()
+    slots: list[dict[str, Any]] = []
+    for i in range(1, 6):
+        provider = (os.environ.get(f"AGENT_{i}_PROVIDER", "") or "").strip().lower()
+        api_key = (os.environ.get(f"AGENT_{i}_API_KEY", "") or "").strip()
+        model = (os.environ.get(f"AGENT_{i}_MODEL", "") or "").strip()
+        slots.append(
+            {
+                "slot": f"agent_{i}",
+                "provider": provider or "groq",
+                "configured": bool(api_key),
+                "model": model,
+            }
+        )
+
+    return ApiResponse(
+        status="ok",
+        data={
+            "providers": ["groq", "cerebras"],
+            "candidate_models": models,
+            "slots": slots,
+        },
+    )
+
+
+@app.post("/health/providers/validate", response_model=ApiResponse)
+async def health_validate_providers(req: ProviderValidationRequest):
+    checks: list[dict[str, Any]] = []
+    for entry in req.entries:
+        provider = entry.provider.strip().lower()
+        model = entry.model.strip()
+        key = entry.api_key.strip()
+        start = time.perf_counter()
+
+        if provider not in {"groq", "cerebras"}:
+            checks.append(
+                {
+                    "slot": entry.slot,
+                    "provider": provider,
+                    "model": model,
+                    "ok": False,
+                    "error": "Unsupported provider",
+                    "latency_ms": 0,
+                }
+            )
+            continue
+
+        if not key:
+            checks.append(
+                {
+                    "slot": entry.slot,
+                    "provider": provider,
+                    "model": model,
+                    "ok": False,
+                    "error": "Missing API key",
+                    "latency_ms": 0,
+                }
+            )
+            continue
+
+        try:
+            llm = get_llm_provider(
+                preferred=provider,
+                groq_api_key=key if provider == "groq" else None,
+                groq_model=model if provider == "groq" else None,
+                cerebras_api_key=key if provider == "cerebras" else None,
+                cerebras_model=model if provider == "cerebras" else None,
+                cerebras_api_base=entry.api_base.strip() or None,
+            )
+
+            text, provider_used = llm.complete(
+                [
+                    {
+                        "role": "user",
+                        "content": 'Reply as JSON only: {"ok": true, "provider": "<name>"}',
+                    }
+                ],
+                temperature=0.0,
+                max_tokens=32,
+                timeout=6.0,
+                model=model or None,
+            )
+            latency_ms = int((time.perf_counter() - start) * 1000)
+
+            if provider_used != provider:
+                checks.append(
+                    {
+                        "slot": entry.slot,
+                        "provider": provider,
+                        "provider_used": provider_used,
+                        "model": model,
+                        "ok": False,
+                        "latency_ms": latency_ms,
+                        "error": f"Provider fallback detected (expected {provider}, got {provider_used})",
+                        "response_preview": (text or "")[:80],
+                    }
+                )
+                continue
+
+            checks.append(
+                {
+                    "slot": entry.slot,
+                    "provider": provider,
+                    "provider_used": provider_used,
+                    "model": model,
+                    "ok": True,
+                    "latency_ms": latency_ms,
+                    "response_preview": (text or "")[:80],
+                }
+            )
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - start) * 1000)
+            checks.append(
+                {
+                    "slot": entry.slot,
+                    "provider": provider,
+                    "model": model,
+                    "ok": False,
+                    "error": str(exc)[:220],
+                    "latency_ms": latency_ms,
+                }
+            )
+
+    ok_count = sum(1 for item in checks if item.get("ok"))
+    return ApiResponse(
+        status="ok",
+        data={
+            "total": len(checks),
+            "ok": ok_count,
+            "failed": len(checks) - ok_count,
+            "checks": checks,
+        },
+    )
 
 
 @app.websocket("/ws/stream")
@@ -309,14 +523,26 @@ async def websocket_stream(websocket: WebSocket):
 async def metrics_realtime(x_org_id: str | None = Header(None)):
     org = _org_id(x_org_id)
     now = datetime.now(timezone.utc)
-    one_min_ago = now - timedelta(minutes=1)
     one_hour_ago = now - timedelta(hours=1)
     two_hours_ago = now - timedelta(hours=2)
+    metrics_window = timedelta(minutes=5)
+    metrics_window_start = now - metrics_window
+    metrics_prev_window_start = metrics_window_start - metrics_window
+    spark_cutoff = now - timedelta(minutes=70)
+    spark_cutoff_text = spark_cutoff.strftime("%Y-%m-%d %H:%M:%S")
 
     with get_sqlite_conn() as conn:
         agents_rows = conn.execute(
             "SELECT agent_addr, did, agent_profile, paused FROM agents WHERE org_id=?",
             (org,),
+        ).fetchall()
+        attestation_rows = conn.execute(
+            "SELECT al.decision, al.created_at "
+            "FROM attestation_log al "
+            "JOIN bundler_registry br ON br.bundler_url = al.bundler_id "
+            "WHERE br.org_id=? AND al.created_at IS NOT NULL AND al.created_at >= ? "
+            "ORDER BY al.created_at DESC LIMIT 5000",
+            (org, spark_cutoff_text),
         ).fetchall()
         trace_rows = conn.execute(
             "SELECT trace_hash, agent_addr, dag_json, risk_score, council_action, created_at "
@@ -385,21 +611,26 @@ async def metrics_realtime(x_org_id: str | None = Header(None)):
                 }
             )
 
+    attestation_timeline: list[tuple[datetime, str]] = []
+    for row in attestation_rows:
+        created_dt = _safe_parse_iso(row["created_at"])
+        if created_dt is None:
+            continue
+        attestation_timeline.append((created_dt, _decision_kind(row["decision"])))
+
+    # Headline metrics should reflect AA intercept outcomes when available.
+    metrics_timeline = attestation_timeline if attestation_timeline else timeline
+
     active_agents = sum(1 for row in agents_rows if not bool(row["paused"]))
     paused_agents = sum(1 for row in agents_rows if bool(row["paused"]))
 
-    decisions_last_min = sum(1 for dt, _ in timeline if dt >= one_min_ago)
-    decisions_prev_min = sum(
-        1
-        for dt, _ in timeline
-        if (one_min_ago - timedelta(minutes=1)) <= dt < one_min_ago
-    )
-
-    current_hour = [(dt, decision) for dt, decision in timeline if dt >= one_hour_ago]
-    previous_hour = [
+    current_window = [
+        (dt, decision) for dt, decision in metrics_timeline if dt >= metrics_window_start
+    ]
+    previous_window = [
         (dt, decision)
-        for dt, decision in timeline
-        if two_hours_ago <= dt < one_hour_ago
+        for dt, decision in metrics_timeline
+        if metrics_prev_window_start <= dt < metrics_window_start
     ]
 
     def _rate(entries: list[tuple[datetime, str]], target: str) -> float:
@@ -408,10 +639,15 @@ async def metrics_realtime(x_org_id: str | None = Header(None)):
         hits = sum(1 for _, decision in entries if decision == target)
         return (hits / len(entries)) * 100.0
 
-    escalation_rate_pct = _rate(current_hour, "ESCALATE")
-    pause_rate_pct = _rate(current_hour, "PAUSE")
-    prev_escalation_rate = _rate(previous_hour, "ESCALATE")
-    prev_pause_rate = _rate(previous_hour, "PAUSE")
+    escalation_rate_pct = _rate(current_window, "ESCALATE")
+    pause_rate_pct = _rate(current_window, "PAUSE")
+    prev_escalation_rate = _rate(previous_window, "ESCALATE")
+    prev_pause_rate = _rate(previous_window, "PAUSE")
+
+    decisions_per_min = len(current_window) / max(metrics_window.total_seconds() / 60.0, 1.0)
+    prev_decisions_per_min = len(previous_window) / max(
+        metrics_window.total_seconds() / 60.0, 1.0
+    )
 
     active_alerts: list[dict[str, Any]] = []
     alert_timeline: list[tuple[datetime, int]] = []
@@ -473,7 +709,9 @@ async def metrics_realtime(x_org_id: str | None = Header(None)):
 
     for bucket in minute_buckets:
         window_end = bucket + timedelta(minutes=1)
-        entries = [decision for dt, decision in timeline if bucket <= dt < window_end]
+        entries = [
+            decision for dt, decision in metrics_timeline if bucket <= dt < window_end
+        ]
         spark_decisions.append(len(entries))
         if entries:
             spark_escalate.append(
@@ -522,7 +760,7 @@ async def metrics_realtime(x_org_id: str | None = Header(None)):
             "api_status": "healthy",
             "active_agents": active_agents,
             "paused_agents": paused_agents,
-            "decisions_per_min": decisions_last_min,
+            "decisions_per_min": decisions_per_min,
             "escalation_rate_pct": escalation_rate_pct,
             "pause_rate_pct": pause_rate_pct,
             "recovery_backlog": recovery_backlog,
@@ -538,7 +776,7 @@ async def metrics_realtime(x_org_id: str | None = Header(None)):
             },
             "delta": {
                 "active_agents": 0,
-                "decisions_per_min": decisions_last_min - decisions_prev_min,
+                "decisions_per_min": decisions_per_min - prev_decisions_per_min,
                 "escalation_rate_pct": escalation_rate_pct - prev_escalation_rate,
                 "pause_rate_pct": pause_rate_pct - prev_pause_rate,
                 "recovery_backlog": recovery_recent - recovery_prev,
@@ -828,7 +1066,7 @@ async def list_traces(x_org_id: str | None = Header(None), limit: int = 50):
     limit = min(limit, 200)
     with get_sqlite_conn() as conn:
         rows = conn.execute(
-            "SELECT flow_id, agent_addr, trace_hash, flag_count, risk_score, council_action, created_at "
+            "SELECT flow_id, agent_addr, trace_hash, dag_json, flag_count, risk_score, council_action, created_at "
             "FROM traces WHERE org_id=? ORDER BY created_at DESC LIMIT ?",
             (org, limit),
         ).fetchall()
@@ -842,6 +1080,10 @@ async def replay_trace(flow_id: str, x_org_id: str | None = Header(None)):
         row = conn.execute(
             "SELECT * FROM traces WHERE flow_id=? AND org_id=?", (flow_id, org)
         ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT * FROM traces WHERE trace_hash=? AND org_id=?", (flow_id, org)
+            ).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Trace not found")
     d = dict(row)
@@ -952,6 +1194,14 @@ async def export_decision_bundle(trace_hash: str, x_org_id: str | None = Header(
         "recovery_alerts": recovery_alerts,
         "lifecycle_context": lifecycle,
     }
+
+    if dag:
+        try:
+            payload["otel_trace"] = TraceDAG.from_dict(dag).to_otel_trace()
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            payload["otel_trace"] = None
+    else:
+        payload["otel_trace"] = None
 
     return ApiResponse(status="ok", data=payload)
 
@@ -1222,6 +1472,7 @@ async def validate_user_op(
             data={
                 "decision": action,
                 "risk_score": score,
+                "user_op_hash": chain_event.tx_hash,
                 "degraded": degraded,
                 "degraded_reason": degraded_reason,
                 "decision_source": decision_source,
@@ -1360,20 +1611,84 @@ async def guard_check(req: GuardRequest):
 
 
 class IngestRequest(BaseModel):
-    agent_id: str
+    event: dict[str, Any] | None = None
+    agent_id: str = ""
     org_id: str = "default"
+    simulation: bool = False
     action: str = ""
     calldata: str = ""
     value_wei: int = 0
     gas_price: int = 0
     tx_hash: str = ""
+    timestamp: float | None = None
     network: str = "anvil"
 
 
 @app.post("/ingest", response_model=ApiResponse)
 async def ingest_event(req: IngestRequest):
     """Manually inject an event into the PramanaFlow (for testing/simulation)."""
-    event = ChainEvent(**req.model_dump())
+    server_ts = time.time()
+
+    if req.simulation and req.timestamp is not None:
+        event_ts = float(req.timestamp)
+    else:
+        # Production ingest always uses server time, regardless of submitted timestamp.
+        event_ts = server_ts
+
+    event_payload = dict(req.event or {})
+    if event_payload:
+        metadata = event_payload.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["simulation"] = bool(req.simulation)
+
+        passthrough_keys = {
+            "agent_id",
+            "org_id",
+            "tx_hash",
+            "action",
+            "calldata",
+            "value_wei",
+            "gas_price",
+            "network",
+            "metadata",
+            "timestamp",
+            "simulation",
+        }
+        for key, value in event_payload.items():
+            if key not in passthrough_keys and key not in metadata:
+                metadata[key] = value
+
+        event = ChainEvent(
+            agent_id=str(
+                event_payload.get("agent_id")
+                or event_payload.get("from_address")
+                or req.agent_id
+                or "unknown"
+            ),
+            org_id=str(event_payload.get("org_id") or req.org_id),
+            tx_hash=str(event_payload.get("tx_hash") or req.tx_hash),
+            action=str(event_payload.get("action") or req.action),
+            calldata=str(event_payload.get("calldata") or req.calldata),
+            value_wei=int(event_payload.get("value_wei") or req.value_wei),
+            gas_price=int(event_payload.get("gas_price") or req.gas_price),
+            timestamp=event_ts,
+            network=str(event_payload.get("network") or req.network),
+            metadata=metadata,
+        )
+    else:
+        event = ChainEvent(
+            agent_id=req.agent_id,
+            org_id=req.org_id,
+            tx_hash=req.tx_hash,
+            action=req.action,
+            calldata=req.calldata,
+            value_wei=req.value_wei,
+            gas_price=req.gas_price,
+            timestamp=event_ts,
+            network=req.network,
+        )
+
     state = PramanaState(event=event, degraded_mode=DegradedMode.NORMAL)
 
     flow = PramanaFlow()
@@ -1383,7 +1698,7 @@ async def ingest_event(req: IngestRequest):
             asyncio.get_event_loop().run_in_executor(
                 None, lambda: flow.kickoff(inputs={"event": event.model_dump()})
             ),
-            timeout=25,
+            timeout=12,
         )
     except asyncio.TimeoutError:
         return ApiResponse(
@@ -1395,6 +1710,19 @@ async def ingest_event(req: IngestRequest):
                 "risk_score": state.risk_score,
                 "trace_hash": state.trace_hash,
                 "note": "flow execution timed out at API layer",
+            },
+        )
+    except Exception as e:
+        logger.exception("Ingest flow crashed: %s", str(e)[:200])
+        return ApiResponse(
+            status="ok",
+            data={
+                "flow_id": state.flow_id,
+                "action": "ESCALATE",
+                "flag_count": 0,
+                "risk_score": 1.0,
+                "trace_hash": state.trace_hash,
+                "note": f"flow crash: {type(e).__name__}",
             },
         )
 

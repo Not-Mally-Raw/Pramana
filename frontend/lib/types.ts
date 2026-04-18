@@ -15,10 +15,13 @@ export interface DagNodeEvent {
   type: "dag_node";
   trace_id: string;
   node_name: string;
+  node_id?: string;
   score: number;
   flagged: boolean;
   latency_ms: number;
   reason: string;
+  reasoning?: string;
+  plain_english?: string;
   timestamp: number;
   org_id?: string;
 }
@@ -100,4 +103,55 @@ export interface TraceRecord {
   risk_score: number;
   council_action: string;
   created_at: string;
+}
+
+export interface PlatformReadiness {
+  org_id: string;
+  api_status: "healthy" | "degraded" | "down";
+  active_agents: number;
+  paused_agents: number;
+  decisions_per_min: number;
+  connected_stream_clients: number;
+  fleet_size: number;
+  dag_stream_enabled: boolean;
+  ready_for_live_demo: boolean;
+}
+
+export interface ProviderSlotStatus {
+  slot: string;
+  provider: "groq" | "cerebras" | string;
+  configured: boolean;
+  model: string;
+}
+
+export interface ProviderStatus {
+  providers: string[];
+  candidate_models: Record<string, string[]>;
+  slots: ProviderSlotStatus[];
+}
+
+export interface ProviderValidationEntry {
+  slot: string;
+  provider: string;
+  api_key: string;
+  model: string;
+  api_base?: string;
+}
+
+export interface ProviderValidationCheck {
+  slot: string;
+  provider: string;
+  provider_used?: string;
+  model: string;
+  ok: boolean;
+  latency_ms: number;
+  error?: string;
+  response_preview?: string;
+}
+
+export interface ProviderValidationResult {
+  total: number;
+  ok: number;
+  failed: number;
+  checks: ProviderValidationCheck[];
 }

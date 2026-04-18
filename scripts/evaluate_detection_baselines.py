@@ -284,6 +284,19 @@ def _run_pramana_l1(
     settings = get_settings()
     crew = MonitoringCrew()
 
+    def _seed_operations_history(base_event: ChainEvent, idx: int, event_count: int = 10) -> None:
+        """Seed normal-frequency history so OperationsAgent has a rolling window.
+
+        This keeps the evaluation harness realistic for window-based detectors.
+        One event every 30s for 5 minutes → ~2/min baseline.
+        """
+        base_ts = float(base_event.timestamp) - 300.0
+        for i in range(int(event_count)):
+            seed_event = base_event.model_copy(deep=True)
+            seed_event.tx_hash = f"0x{idx:032x}{(10_000 + i):032x}"
+            seed_event.timestamp = base_ts + (i * 30.0)
+            insert_event(seed_event.model_dump())
+
     y_pred_any_flag: list[int] = []
     y_pred_routing: list[int] = []
     risk_scores: list[float] = []
@@ -305,9 +318,10 @@ def _run_pramana_l1(
 
         # Operations detection is sequence-based; seed short burst history.
         if sample.attack_type == "operations":
+            _seed_operations_history(event, idx=idx, event_count=10)
             for i in range(6):
                 burst_event = event.model_copy(deep=True)
-                burst_event.tx_hash = "0x" + uuid.uuid4().hex * 2
+                burst_event.tx_hash = f"0x{idx:032x}{i:032x}"
                 burst_event.timestamp = event.timestamp - (i + 1) * 5
                 insert_event(burst_event.model_dump())
 
@@ -318,9 +332,25 @@ def _run_pramana_l1(
         flag_count = sum(1 for r in results if r.flagged)
         fused_score = MonitoringAndInterventionCrew._fuse_l1_risk(results)
 
+        injection_result = next((r for r in results if r.agent_name == "injection"), None)
+        injection_pause = (
+            bool(injection_result)
+            and bool(injection_result.flagged)
+            and float(injection_result.score) >= 0.85
+        )
+
+        max_flagged_score = 0.0
+        for r in results:
+            if r.agent_name == "injection":
+                continue
+            if r.flagged:
+                max_flagged_score = max(max_flagged_score, float(r.score))
+
         pred_positive = (
-            flag_count >= settings.ESCALATION_FLAG_THRESHOLD
+            injection_pause
+            or flag_count >= settings.ESCALATION_FLAG_THRESHOLD
             or fused_score >= settings.RISK_SCORE_ESCALATE
+            or max_flagged_score >= settings.SINGLE_AGENT_ESCALATE_SCORE
         )
         pred_any_flag = flag_count > 0
 
@@ -527,6 +557,11 @@ def main() -> int:
 
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        # Convenience top-level keys for quick comparisons in scripts/docs.
+        "pramana_any_flag": pramana_any_flag_metrics,
+        "pramana_routing_gate": pramana_routing_metrics,
+        "baseline_threshold_only": base_a_metrics,
+        "baseline_single_judge_proxy": base_b_metrics,
         "config": {
             "samples_per_class": args.samples_per_class,
             "dataset_total": len(dataset),

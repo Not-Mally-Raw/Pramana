@@ -58,7 +58,16 @@ class Settings(BaseSettings):
     GROQ_MODEL_COUNCIL: str = "llama-3.3-70b-versatile"  # council voting
     GROQ_MAX_TOKENS: int = 512
     GROQ_TIMEOUT_S: float = 8.0
-    COUNCIL_DELAY_S: float = 2.0  # delay between sequential council calls
+    COUNCIL_DELAY_S: float = 0.2  # delay between sequential council calls
+
+    # Cerebras (optional). If unset, Groq or deterministic fallback is used.
+    CEREBRAS_API_KEY: str = ""
+    # Cerebras exposes an OpenAI-compatible chat completions API.
+    # Configure base URL + model via env or .env.
+    CEREBRAS_API_BASE: str = "https://api.cerebras.ai/v1"
+    CEREBRAS_MODEL_L1: str = ""
+    CEREBRAS_MAX_TOKENS: int = 512
+    CEREBRAS_TIMEOUT_S: float = 8.0
 
     # ── Databases ────────────────────────────────────────────────────────────
     SQLITE_PATH: str = "data/pramana.db"
@@ -70,15 +79,24 @@ class Settings(BaseSettings):
     ESCALATION_FLAG_THRESHOLD: int = 2  # flags >= this → escalate
     RISK_SCORE_PAUSE: float = 0.70  # auto-pause above this
     RISK_SCORE_ESCALATE: float = 0.40
+    SINGLE_AGENT_ESCALATE_SCORE: float = 0.85  # any single L1 score >= this → escalate
     HALLUC_SCORE_THRESHOLD: float = 0.80  # below this → flag
     DRIFT_SIMILARITY_THRESHOLD: float = 0.70  # below this → flag
+    DRIFT_MULTISCALE_ENABLED: bool = True
+    DRIFT_MULTISCALE_THRESHOLD: float = 0.30
     BALANCE_DRAIN_PCT: float = 0.10  # >10% drain → flag
+    AA_MAX_INTENT_VALUE_ETH: float = 5.0  # absolute AA intent threshold, not a percentage
     ACTION_LOOP_PER_MIN: int = 5  # >5 actions/min → flag
     GAS_SPIKE_MULTIPLIER: float = 2.0  # gas > 2x avg → flag
     RISK_UNCERTAINTY_PENALTY: float = 0.10  # add risk when signals are skipped/missing
     RISK_FLAG_DENSITY_BONUS: float = (
         0.20  # max additive bonus from multi-signal agreement
     )
+
+    # ── MRL embeddings ──────────────────────────────────────────────────────
+    MRL_MODEL: str = "nomic-embed-text-v1.5"
+    MRL_INFERENCE_MODE: str = "dynamic"  # local | dynamic | remote
+    MRL_DEVICE: str = ""  # optional explicit local device hint
 
     # ── Recovery / finality ─────────────────────────────────────────────────
     # Used by FinancialRecoveryService to treat positions as "effectively final"
@@ -149,7 +167,7 @@ class Settings(BaseSettings):
 
     # ── API / UI ────────────────────────────────────────────────────────────
     API_PORT: int = 8000
-    CORS_ORIGINS: str = "http://localhost:3000"
+    CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     # ── Alerts ───────────────────────────────────────────────────────────────
     TELEGRAM_BOT_TOKEN: str = ""

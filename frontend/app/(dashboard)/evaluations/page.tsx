@@ -4,11 +4,13 @@ import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchRealtimeMetrics } from "@/lib/api";
 import { riskToHex } from "@/lib/design-tokens";
+import { useRuntimeConfigStore } from "@/stores/runtime";
 
 const PROFILES = ["treasury", "arb_bot", "keeper", "rebalancer", "market_maker"];
 const VECTORS = ["injection", "baseline_poisoning", "pga", "nonce_abuse", "sanctioned"];
 
 export default function EvaluationsPage() {
+  const orgId = useRuntimeConfigStore((state) => state.orgId);
   const [continuous, setContinuous] = useState(true);
   const [nightly, setNightly] = useState(false);
   const [profile, setProfile] = useState(PROFILES[0]);
@@ -16,7 +18,7 @@ export default function EvaluationsPage() {
   const [rounds, setRounds] = useState(5);
 
   const metricsQuery = useQuery({
-    queryKey: ["evaluations-stream"],
+    queryKey: ["evaluations-stream", orgId],
     queryFn: fetchRealtimeMetrics,
     refetchInterval: 15_000,
   });

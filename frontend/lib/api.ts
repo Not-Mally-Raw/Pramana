@@ -1,7 +1,37 @@
-import type { RealtimeMetrics, TraceRecord } from "@/lib/types";
+import type {
+  PlatformReadiness,
+  ProviderStatus,
+  ProviderValidationEntry,
+  ProviderValidationResult,
+  RealtimeMetrics,
+  TraceRecord,
+} from "@/lib/types";
+import { useRuntimeConfigStore } from "@/stores/runtime";
 
-const API_BASE = process.env.NEXT_PUBLIC_PRAMANA_API_URL || "http://127.0.0.1:8000";
-const API_JWT = process.env.NEXT_PUBLIC_PRAMANA_JWT || "";
+const DEFAULT_API_BASE = process.env.NEXT_PUBLIC_PRAMANA_API_URL || "http://127.0.0.1:8000";
+const DEFAULT_JWT = process.env.NEXT_PUBLIC_PRAMANA_JWT || "";
+const DEFAULT_ORG = process.env.NEXT_PUBLIC_PRAMANA_ORG_ID || decodeOrgIdFromJwt(DEFAULT_JWT) || "default";
+
+function decodeOrgIdFromJwt(token: string): string {
+  if (!token) {
+    return "";
+  }
+
+  try {
+    const payloadSegment = token.split(".")[1];
+    if (!payloadSegment) {
+      return "";
+    }
+
+    const normalized = payloadSegment.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+    const decoded = globalThis.atob(padded);
+    const parsed = JSON.parse(decoded) as { org_id?: unknown };
+    return typeof parsed.org_id === "string" ? parsed.org_id : "";
+  } catch {
+    return "";
+  }
+}
 
 const EMPTY_METRICS: RealtimeMetrics = {
   api_status: "down",
@@ -35,20 +65,40 @@ const EMPTY_METRICS: RealtimeMetrics = {
 };
 
 function buildHeaders(): HeadersInit {
-  if (!API_JWT) {
-    return {
-      "Content-Type": "application/json",
-    };
+  const cfg = getApiConfig();
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  if (cfg.orgId) {
+    headers["X-Org-Id"] = cfg.orgId;
   }
 
+  if (cfg.jwt) {
+    headers.Authorization = `Bearer ${cfg.jwt}`;
+  }
+
+  return headers;
+}
+
+export interface ApiRuntimeConfig {
+  apiBase: string;
+  orgId: string;
+  jwt: string;
+}
+
+export function getApiConfig(): ApiRuntimeConfig {
+  const state = useRuntimeConfigStore.getState();
   return {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${API_JWT}`,
+    apiBase: state.apiBase || DEFAULT_API_BASE,
+    orgId: state.orgId || DEFAULT_ORG,
+    jwt: state.jwt || DEFAULT_JWT,
   };
 }
 
 async function requestApi<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
+  const cfg = getApiConfig();
+  const response = await fetch(`${cfg.apiBase}${path}`, {
     ...init,
     headers: {
       ...buildHeaders(),
@@ -71,7 +121,7 @@ async function requestApi<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export function getApiBase(): string {
-  return API_BASE;
+  return getApiConfig().apiBase;
 }
 
 export interface AgentRow {
@@ -123,4 +173,19 @@ export async function fetchDecisionExport(traceHash: string): Promise<Record<str
   } catch {
     return null;
   }
+}
+
+export async function fetchPlatformReadiness(): Promise<PlatformReadiness> {
+  return requestApi<PlatformReadiness>("/health/platform-readiness");
+}
+
+export async function fetchProviderStatus(): Promise<ProviderStatus> {
+  return requestApi<ProviderStatus>("/health/providers/status");
+}
+
+export async function validateProviderKeys(entries: ProviderValidationEntry[]): Promise<ProviderValidationResult> {
+  return requestApi<ProviderValidationResult>("/health/providers/validate", {
+    method: "POST",
+    body: JSON.stringify({ entries }),
+  });
 }

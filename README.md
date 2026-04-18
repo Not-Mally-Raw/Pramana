@@ -171,6 +171,26 @@ PYTHONPATH=. python scripts/testnet_emitter.py \
   --userop-json '{"callData": "0x12345ignore_previous_instructions"}'
 ```
 
+### Live Fleet Demo With Per-Agent Keys
+```bash
+# 1) Create agent key file (5 slots: 1-3 Groq, 4-5 Cerebras)
+cp scripts/agents/.env.agents.example scripts/agents/.env.agents
+
+# 2) Paste your keys/models into scripts/agents/.env.agents
+
+# 3) Run live fleet traffic for dashboard
+PYTHONPATH=. python scripts/agents/fleet_runner.py \
+  --api-url http://127.0.0.1:8000 \
+  --org demo-prof \
+  --mode sequential \
+  --actions 4 \
+  --delay 0.45 \
+  --summary-json outputs/live_ui_demo/fleet_live.json
+```
+
+For dashboard org targeting, use `frontend/.env.local.example` as template and set
+`NEXT_PUBLIC_PRAMANA_ORG_ID` to the same org passed to `fleet_runner.py`.
+
 ### Detection Baseline Evaluation
 ```bash
 # Reproducible precision/recall/FPR artifact with baseline comparisons
@@ -180,6 +200,15 @@ PYTHONPATH=. python scripts/evaluate_detection_baselines.py \
   --output outputs/detection_eval_100.json
 ```
 This writes a JSON artifact with confusion matrices and attack-type breakdowns.
+
+### Full Validation Gate (Recommended)
+```bash
+# One command: API contracts + pytest + baseline eval + fleet eval + bundler probe
+PYTHONPATH=. python scripts/validation/run_validation_gate.py \
+  --api-url http://127.0.0.1:8000 \
+  --org test_pilot
+```
+This writes a consolidated report to `outputs/validation_gate/validation_report.json`.
 
 ### Full Sprint Simulation
 ```bash
@@ -317,9 +346,10 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 ### Dashboard Navigation
 1. Open http://localhost:3000
-2. Click "Agents" to see council status
-3. Click "Evaluations" to review decisions
-4. Click "Analytics" for trends
+2. Open "Launchpad" to run readiness checks and 5-key provider validation
+3. Open "Command Center" for live active-agent and decision feed
+4. Open "Flow Explorer" to inspect DAG and latency views
+5. Open "Agents" and "Evaluations" for deep-dive analysis
 
 ### Register Test Agents
 ```bash

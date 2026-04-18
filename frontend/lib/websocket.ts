@@ -1,4 +1,4 @@
-import { getApiBase } from "@/lib/api";
+import { getApiBase, getApiConfig } from "@/lib/api";
 import type { StreamEvent } from "@/lib/types";
 
 export type ConnectionState = "connected" | "reconnecting" | "disconnected";
@@ -24,9 +24,11 @@ function toWsBase(url: string): string {
 
 function createStreamUrl(options: StreamOptions): string {
   const params = new URLSearchParams();
+  const runtimeOrg = getApiConfig().orgId;
+  const orgId = options.orgId || runtimeOrg;
 
-  if (options.orgId) {
-    params.set("org_id", options.orgId);
+  if (orgId) {
+    params.set("org_id", orgId);
   }
   if (options.traceId) {
     params.set("trace_id", options.traceId);

@@ -7,9 +7,13 @@ NO Groq calls at L1. Only pattern-based + vector similarity.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
+import numpy as np
+
 from core.agents.base import BaseL1Agent
+from core.embeddings import DIM_STANDARD, get_mrl_embedder
 from core.config.settings import get_settings
 from utils.models import ChainEvent, L1Result, PramanaState
 
@@ -60,22 +64,29 @@ class HallucinationAgent(BaseL1Agent):
                 pass_count=0,
             )
 
-        similarity = self._chroma_similarity(
-            event.agent_id, event.org_id, event.calldata or ""
-        )
-        if similarity is None:
-            # Fix 9: Cold-start now flags conservatively instead of passing.
-            # New agents with no baseline should be escalated, not trusted.
+        start_ms = state.pipeline_start_ms or (time.perf_counter() * 1000)
+        elapsed_ms = max(0.0, (time.perf_counter() * 1000) - start_ms)
+        baseline_texts = self._baseline_texts(event.agent_id, event.org_id)
+
+        if not baseline_texts:
             meta["vector_unavailable"] = True
             meta["warmup"] = True
             return self._make_result(
                 self.name,
-                True,  # was: False — silently passed new agents
-                0.50,  # was: 0.25 — too permissive
+                False,
+                min(0.25, s.HALLUC_SCORE_THRESHOLD * 0.5),
                 "warmup_period: no vector baseline established",
                 meta,
-                pass_count=1,
+                pass_count=0,
             )
+
+        similarity, dim_used = self._compute_similarity_mrl(
+            event.calldata or "",
+            baseline_texts,
+            elapsed_ms,
+        )
+        meta["pipeline_elapsed_ms"] = round(elapsed_ms, 1)
+        meta["mrl_dimension_used"] = dim_used
 
         meta["chroma_similarity"] = round(similarity, 4)
 
@@ -123,35 +134,58 @@ class HallucinationAgent(BaseL1Agent):
     # ── Internals ─────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _chroma_similarity(agent_id: str, org_id: str, text: str) -> float | None:
-        """Query ChromaDB for cosine similarity vs baseline corpus. Returns None when unavailable."""
-        from utils.cache import EMBEDDING_CACHE
-
-        cache_key = f"{agent_id}:{hash(text[:256])}"
-        if cache_key in EMBEDDING_CACHE:
-            return EMBEDDING_CACHE[cache_key]
+    def _baseline_texts(agent_id: str, org_id: str, limit: int = 30) -> list[str]:
         try:
-            import chromadb
+            from core.db import get_sqlite_conn
 
-            from core.config.settings import get_settings as _gs
+            with get_sqlite_conn() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT calldata
+                    FROM events
+                    WHERE agent_addr=? AND org_id=?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (agent_id, org_id, int(limit)),
+                ).fetchall()
 
-            s = _gs()
-            client = chromadb.PersistentClient(path=s.CHROMA_PATH)
-            col = client.get_or_create_collection(
-                s.CHROMA_COLLECTION,
-                metadata={"hnsw:space": "cosine"},
-            )
-            if col.count() == 0:
-                return None
-            results = col.query(query_texts=[text[:512]], n_results=1)
-            distances = results.get("distances", [[]])[0]
-            if not distances:
-                return None
-            similarity = 1.0 - distances[0]
-            EMBEDDING_CACHE[cache_key] = similarity
-            return similarity
+            texts = []
+            for row in rows:
+                calldata = (row[0] or "").strip()
+                if calldata:
+                    texts.append(calldata[:512])
+            return texts
         except Exception:
-            return None
+            return []
+
+    @staticmethod
+    def _compute_similarity_mrl(
+        current_text: str,
+        baseline_texts: list[str],
+        elapsed_ms: float = 0.0,
+    ) -> tuple[float, int]:
+        """Compute similarity with latency-aware MRL dimensionality."""
+        if elapsed_ms < 60:
+            dim = 512
+        elif elapsed_ms < 120:
+            dim = DIM_STANDARD
+        else:
+            dim = 128
+
+        embedder = get_mrl_embedder()
+        all_texts = [current_text] + baseline_texts
+        all_embeddings = embedder.embed(all_texts, dimensionality=dim)
+
+        current_emb = all_embeddings[0]
+        baseline_embs = all_embeddings[1:]
+
+        if len(baseline_embs) == 0:
+            return 0.5, dim
+
+        similarities = embedder.batch_cosine_similarity(current_emb, baseline_embs)
+        mean_similarity = float(np.mean(similarities)) if similarities.size else 0.5
+        return mean_similarity, dim
 
     @staticmethod
     def _historical_success_rate(agent_addr: str, org_id: str, action: str) -> float:

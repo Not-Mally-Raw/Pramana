@@ -7,8 +7,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import jwt
 import requests
 
+from core.config.settings import get_settings
 from scripts.testnet_config import (
     METRICS_POLL_INTERVAL_S,
     MONITOR_TOTAL_DURATION_S,
@@ -44,11 +46,20 @@ class MetricsCollector:
         with open(self.metrics_file, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=self.fieldnames).writeheader()
 
+    @staticmethod
+    def _auth_headers(org_id: str) -> dict[str, str]:
+        s = get_settings()
+        token = jwt.encode({"org_id": org_id}, s.JWT_SECRET, algorithm="HS256")
+        return {
+            "Authorization": f"Bearer {token}",
+            "X-Org-Id": org_id,
+        }
+
     def collect_metrics(self, api_url: str, org_id: str) -> dict:
         try:
             resp = requests.get(
                 f"{api_url}/traces",
-                headers={"X-Org-Id": org_id},
+                headers=self._auth_headers(org_id),
                 params={"limit": 50},
                 timeout=10,
             )

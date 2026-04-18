@@ -11,6 +11,8 @@ from typing import Any
 
 from fastapi import WebSocket
 
+from core.agents.base import _human_reason
+
 logger = logging.getLogger("pramana.realtime")
 
 
@@ -134,8 +136,31 @@ class RealtimeHub:
 realtime_hub = RealtimeHub()
 
 
+def _get_plain_english_summary(event: dict[str, Any]) -> str:
+    """Generate a one-sentence summary for non-technical viewers."""
+    node = str(event.get("node_name") or "This check")
+    score = float(event.get("score") or 0.0)
+    flagged = bool(event.get("flagged", False))
+
+    if not flagged:
+        confidence = max(0.0, min(1.0, 1.0 - score))
+        return (
+            f"{node} checked this transaction and found nothing concerning. "
+            f"(confidence: {confidence * 100:.0f}%)"
+        )
+
+    return (
+        f"{node} flagged a potential issue with this transaction. "
+        f"Risk: {score * 100:.0f}%. Review recommended."
+    )
+
+
 def publish_event(event: dict[str, Any]) -> None:
     try:
-        realtime_hub.publish(event)
+        payload = dict(event)
+        if payload.get("type") in {"dag_node", "dag_node_complete"}:
+            payload["reasoning"] = _human_reason(str(payload.get("reason") or ""))
+            payload["plain_english"] = _get_plain_english_summary(payload)
+        realtime_hub.publish(payload)
     except Exception as exc:
         logger.debug("realtime publish failed: %s", exc)

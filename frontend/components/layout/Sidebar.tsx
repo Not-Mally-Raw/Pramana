@@ -17,6 +17,7 @@ import { useAlertsStore } from "@/stores/alerts";
 import { useSystemStore } from "@/stores/system";
 
 const NAV_ITEMS = [
+  { href: "/launch", label: "Launchpad", Icon: Activity },
   { href: "/", label: "Command Center", Icon: Activity },
   { href: "/agents", label: "Agent Detail", Icon: ShieldCheck },
   { href: "/pipeline", label: "Flow Explorer", Icon: ChartScatter },

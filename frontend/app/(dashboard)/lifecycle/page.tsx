@@ -4,10 +4,12 @@ import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ComplianceExport } from "@/components/ui/ComplianceExport";
 import { fetchRealtimeMetrics } from "@/lib/api";
+import { useRuntimeConfigStore } from "@/stores/runtime";
 
 export default function LifecyclePage() {
+  const orgId = useRuntimeConfigStore((state) => state.orgId);
   const metricsQuery = useQuery({
-    queryKey: ["lifecycle-metrics"],
+    queryKey: ["lifecycle-metrics", orgId],
     queryFn: fetchRealtimeMetrics,
     refetchInterval: 20_000,
   });

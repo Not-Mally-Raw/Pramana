@@ -2,10 +2,12 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { RealtimeProvider } from "@/components/providers/RealtimeProvider";
+import { useRuntimeConfigStore } from "@/stores/runtime";
 
 export function AppProviders({ children }: { children: ReactNode }) {
+  const hydrateRuntime = useRuntimeConfigStore((state) => state.hydrate);
   const [queryClient] = useState(
     () =>
       new QueryClient({
@@ -18,6 +20,10 @@ export function AppProviders({ children }: { children: ReactNode }) {
         },
       }),
   );
+
+  useEffect(() => {
+    hydrateRuntime();
+  }, [hydrateRuntime]);
 
   return (
     <QueryClientProvider client={queryClient}>

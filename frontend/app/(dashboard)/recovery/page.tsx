@@ -4,10 +4,12 @@ import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { PositionScatter } from "@/components/charts/PositionScatter";
 import { fetchRealtimeMetrics } from "@/lib/api";
+import { useRuntimeConfigStore } from "@/stores/runtime";
 
 export default function RecoveryPage() {
+  const orgId = useRuntimeConfigStore((state) => state.orgId);
   const metricsQuery = useQuery({
-    queryKey: ["recovery-metrics"],
+    queryKey: ["recovery-metrics", orgId],
     queryFn: fetchRealtimeMetrics,
     refetchInterval: 8_000,
   });

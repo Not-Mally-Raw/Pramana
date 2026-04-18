@@ -49,16 +49,23 @@ class CouncilAgent:
         """Run 3 sequential Groq council calls and return weighted majority verdict."""
         evidence = self._build_evidence(state)
         votes: list[CouncilVote] = []
+        is_simulation = bool(getattr(getattr(state, "event", None), "metadata", {}).get("simulation", False))
+        judges = _JUDGES[:2] if is_simulation else _JUDGES
+        delay_s = state.settings.COUNCIL_DELAY_S if hasattr(state, "settings") else 0.2
+        if is_simulation:
+            delay_s = 0.0
+        groq_failed = False
 
-        for judge_id, temperature, weight in _JUDGES:
-            if can_call_groq():
+        for judge_id, temperature, weight in judges:
+            if not groq_failed and can_call_groq():
                 vote = self._call_groq(judge_id, temperature, weight, evidence)
+                if vote.model == "fallback":
+                    groq_failed = True
             else:
                 vote = self._deterministic_vote(judge_id, weight, state)
             votes.append(vote)
-            time.sleep(
-                state.settings.COUNCIL_DELAY_S if hasattr(state, "settings") else 2.0
-            )
+            if delay_s > 0:
+                time.sleep(delay_s)
 
         return self._tally_votes(votes, state)
 

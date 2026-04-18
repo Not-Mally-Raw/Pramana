@@ -96,7 +96,12 @@ class EconomicSanityAgent(BaseL1Agent):
             event.value_wei, event.gas_price
         )
         meta["expected_value_after_gas"] = round(expected_value_after_gas, 6)
-        if expected_value_after_gas < 0:
+        # Only apply this check when there's an actual ETH value transfer.
+        # For most DeFi calls, tx.value is 0 even though the action can still be
+        # economically rational (token swaps, approvals, rebalances, etc.).
+        # Flagging all zero-value calls would generate persistent false positives.
+        meta["expected_value_check_applied"] = bool(event.value_wei)
+        if event.value_wei and expected_value_after_gas < 0:
             issues.append(
                 f"expected_value_after_gas negative: {expected_value_after_gas}"
             )

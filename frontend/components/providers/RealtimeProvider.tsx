@@ -8,6 +8,7 @@ import { openRealtimeStream } from "@/lib/websocket";
 import { useAlertsStore } from "@/stores/alerts";
 import { useAgentsStore } from "@/stores/agents";
 import { useDecisionsStore } from "@/stores/decisions";
+import { useRuntimeConfigStore } from "@/stores/runtime";
 import { useSystemStore } from "@/stores/system";
 
 export function RealtimeProvider({ children }: { children: ReactNode }) {
@@ -22,9 +23,11 @@ export function RealtimeProvider({ children }: { children: ReactNode }) {
   const setWsState = useSystemStore((state) => state.setWsState);
   const setRealtimeHeader = useSystemStore((state) => state.setRealtimeHeader);
   const wsState = useSystemStore((state) => state.wsState);
+  const orgId = useRuntimeConfigStore((state) => state.orgId);
 
   useEffect(() => {
     const dispose = openRealtimeStream({
+      orgId,
       getSince: () => useDecisionsStore.getState().lastTimestamp,
       onConnectionChange: (state) => {
         setWsState(state);
@@ -50,10 +53,10 @@ export function RealtimeProvider({ children }: { children: ReactNode }) {
     return () => {
       dispose();
     };
-  }, [addDecision, applyLifecycle, setLivePaused, setWsState, upsertAlert]);
+  }, [addDecision, applyLifecycle, orgId, setLivePaused, setWsState, upsertAlert]);
 
   const metricsQuery = useQuery({
-    queryKey: ["realtime-provider"],
+    queryKey: ["realtime-provider", orgId],
     queryFn: fetchRealtimeMetrics,
     refetchInterval: wsState === "connected" ? 15_000 : 5_000,
   });

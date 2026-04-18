@@ -1,6 +1,7 @@
 import argparse
 import json
 import sys
+import time
 
 import requests
 
@@ -51,14 +52,17 @@ def list_agents(api_url: str, org_id: str) -> list:
         s = get_settings()
         token = jwt.encode({"org_id": org_id}, s.JWT_SECRET, algorithm="HS256")
 
-        resp = requests.get(
-            f"{api_url}/agents",
-            headers={"X-Org-Id": org_id, "Authorization": f"Bearer {token}"},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("data", [])
+        headers = {"X-Org-Id": org_id, "Authorization": f"Bearer {token}"}
+        for attempt in range(4):
+            resp = requests.get(f"{api_url}/agents", headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("data", [])
+            if resp.status_code == 429 and attempt < 3:
+                time.sleep(0.35 * (attempt + 1))
+                continue
+            print(f"List agents returned HTTP {resp.status_code}: {resp.text[:160]}")
+            return []
     except Exception as e:
         print(f"List agents failed: {e}")
     return []

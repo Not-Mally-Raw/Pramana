@@ -5,14 +5,17 @@ import { useQuery } from "@tanstack/react-query";
 import { MetricCard } from "@/components/ui/MetricCard";
 import { DecisionBadge } from "@/components/ui/DecisionBadge";
 import { AgentCard } from "@/components/ui/AgentCard";
+import { HowItWorksPanel } from "@/components/ui/HowItWorksPanel";
 import { fetchAgents, fetchRealtimeMetrics } from "@/lib/api";
 import type { DecisionEvent } from "@/lib/types";
 import { useAlertsStore } from "@/stores/alerts";
 import { useAgentsStore } from "@/stores/agents";
 import { useDecisionsStore } from "@/stores/decisions";
+import { useRuntimeConfigStore } from "@/stores/runtime";
 import { riskGradientStyle } from "@/lib/design-tokens";
 
 export default function CommandCenterPage() {
+  const orgId = useRuntimeConfigStore((state) => state.orgId);
   const decisions = useDecisionsStore((state) => state.decisions);
   const addBatch = useDecisionsStore((state) => state.addBatch);
   const fleet = useAgentsStore((state) => state.fleet);
@@ -20,14 +23,14 @@ export default function CommandCenterPage() {
   const setAlertsFromMetrics = useAlertsStore((state) => state.setFromMetrics);
 
   const metricsQuery = useQuery({
-    queryKey: ["metrics-realtime"],
+    queryKey: ["metrics-realtime", orgId],
     queryFn: fetchRealtimeMetrics,
     refetchInterval: 5_000,
     staleTime: 4_000,
   });
 
   const agentsQuery = useQuery({
-    queryKey: ["agents-list"],
+    queryKey: ["agents-list", orgId],
     queryFn: fetchAgents,
     refetchInterval: 15_000,
   });
@@ -159,6 +162,8 @@ export default function CommandCenterPage() {
           )}
         </article>
       </div>
+
+      <HowItWorksPanel />
     </section>
   );
 }

@@ -41,11 +41,11 @@ print("\n2. Arb Bot Profile:")
 state_arb = PramanaState(event=event, agent_profile="arb_bot")
 result = agent.check(event, state_arb)
 assert result.metadata["profile"] == "arb_bot"
-assert result.metadata["thresholds_applied"]["ACTION_LOOP_PER_MIN"] == 30
+assert result.metadata["thresholds_applied"]["ACTION_LOOP_PER_MIN"] == 60
 assert result.metadata["thresholds_applied"]["BALANCE_DRAIN_PCT"] == 0.20
 assert result.metadata["thresholds_applied"]["RISK_SCORE_PAUSE"] == 0.80
 print("   ✓ Profile: arb_bot")
-print(f"   ✓ ACTION_LOOP_PER_MIN: 30 (loose)")
+print(f"   ✓ ACTION_LOOP_PER_MIN: 60 (loose)")
 print(f"   ✓ BALANCE_DRAIN_PCT: 0.20 (loose)")
 print(f"   ✓ RISK_SCORE_PAUSE: 0.80 (loose)")
 

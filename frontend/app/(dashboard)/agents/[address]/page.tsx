@@ -1,12 +1,13 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { AgentScoreMatrix } from "@/components/charts/AgentScoreMatrix";
-import { TraceDAGRenderer } from "@/components/dag/TraceDAGRenderer";
+import { ExplainableDAGRenderer } from "@/components/dag/ExplainableDAGRenderer";
 import { DecisionBadge } from "@/components/ui/DecisionBadge";
 import { fetchTraces } from "@/lib/api";
+import { useRuntimeConfigStore } from "@/stores/runtime";
 
 const L1_AGENTS = [
   "sanctions",
@@ -22,11 +23,17 @@ const L1_AGENTS = [
 
 export default function AgentDetailPage() {
   const params = useParams<{ address: string }>();
+  const orgId = useRuntimeConfigStore((state) => state.orgId);
   const address = decodeURIComponent(params.address || "");
   const [selectedTrace, setSelectedTrace] = useState<string>("");
+  const [activeTrace, setActiveTrace] = useState<string | null>(null);
+  const [selectedNodeInfo, setSelectedNodeInfo] = useState<{
+    node: { fullName: string; description: string };
+    state: { plain_english: string; reasoning: string };
+  } | null>(null);
 
   const tracesQuery = useQuery({
-    queryKey: ["agent-traces", address],
+    queryKey: ["agent-traces", orgId, address],
     queryFn: () => fetchTraces(600),
   });
 
@@ -41,6 +48,12 @@ export default function AgentDetailPage() {
     }
     return agentTraces.find((trace) => trace.trace_hash === selectedTrace) || agentTraces[0] || null;
   }, [agentTraces, selectedTrace]);
+
+  useEffect(() => {
+    if (!activeTrace && selected?.trace_hash) {
+      setActiveTrace(selected.trace_hash);
+    }
+  }, [activeTrace, selected?.trace_hash]);
 
   const matrix = useMemo(() => {
     const slice = agentTraces.slice(0, 50);
@@ -104,7 +117,10 @@ export default function AgentDetailPage() {
                 <button
                   key={trace.trace_hash}
                   type="button"
-                  onClick={() => setSelectedTrace(trace.trace_hash)}
+                  onClick={() => {
+                    setSelectedTrace(trace.trace_hash);
+                    setActiveTrace(trace.trace_hash);
+                  }}
                   className="min-w-[90px] rounded-lg border border-border-subtle bg-surface-card px-2 py-2 text-left hover:border-white/30"
                 >
                   <DecisionBadge decision={decision} />
@@ -122,11 +138,44 @@ export default function AgentDetailPage() {
         <AgentScoreMatrix agentNames={L1_AGENTS} values={matrix} />
       </article>
 
-      {selected ? (
-        <TraceDAGRenderer traceId={selected.trace_hash} mode="replay" />
-      ) : (
-        <div className="panel p-4 text-sm text-text-secondary">No trace selected for replay.</div>
-      )}
+      <section className="panel p-4">
+        <div className="mb-4 flex items-center justify-between">
+          <div>
+            <h2 className="text-base font-semibold text-white">Decision Pipeline</h2>
+            <p className="text-sm text-zinc-500">
+              Watch each safety check run in real time. Click a node to see what it found.
+            </p>
+          </div>
+          {activeTrace ? (
+            <span className="rounded bg-zinc-900 px-2 py-1 font-mono text-xs text-zinc-500">
+              Trace: {activeTrace.slice(0, 16)}...
+            </span>
+          ) : null}
+        </div>
+
+        <ExplainableDAGRenderer
+          traceId={activeTrace}
+          mode={activeTrace ? "live" : "idle"}
+          onNodeSelect={(node, state) => setSelectedNodeInfo({ node, state })}
+        />
+
+        {selectedNodeInfo ? (
+          <div className="mt-4 rounded-xl border border-zinc-800 bg-zinc-950 p-4">
+            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-400">
+              What {selectedNodeInfo.node.fullName} Is Saying
+            </h3>
+            <p className="text-sm leading-relaxed text-white">
+              {selectedNodeInfo.state.plain_english || selectedNodeInfo.node.description}
+            </p>
+            {selectedNodeInfo.state.reasoning ? (
+              <details className="mt-3">
+                <summary className="cursor-pointer text-xs text-zinc-600">Show technical reason</summary>
+                <code className="mt-1 block font-mono text-xs text-zinc-500">{selectedNodeInfo.state.reasoning}</code>
+              </details>
+            ) : null}
+          </div>
+        ) : null}
+      </section>
     </section>
   );
 }

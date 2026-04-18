@@ -35,6 +35,7 @@ def generate_event(
     network: str = "anvil",
     rng: random.Random | None = None,
     timestamp: float | None = None,
+    org_id: str = PRAMANA_ORG_ID,
 ) -> dict:
     rng = rng or random
     behavior = get_agent_behavior(agent_addr)
@@ -121,7 +122,7 @@ def generate_event(
 
     return {
         "agent_id": agent_addr,
-        "org_id": PRAMANA_ORG_ID,
+        "org_id": org_id,
         "action": action_choice,
         "calldata": calldata,
         "value_wei": value_wei,
@@ -145,7 +146,10 @@ def emit_event(api_url: str, event: dict) -> tuple[bool, Optional[str]]:
 
         resp = requests.post(
             f"{api_url}/ingest",
-            json={k: v for k, v in event.items() if k != "expected_flag"},
+            json={
+                **{k: v for k, v in event.items() if k != "expected_flag"},
+                "simulation": True,
+            },
             headers={"Authorization": f"Bearer {token}"},
             timeout=15,
         )
@@ -175,13 +179,13 @@ def main():
     parser.add_argument(
         "--event-interval-min",
         type=float,
-        default=10.0,
+        default=0.1,
         help="Minimum seconds between events",
     )
     parser.add_argument(
         "--event-interval-max",
         type=float,
-        default=120.0,
+        default=0.5,
         help="Maximum seconds between events",
     )
     args = parser.parse_args()
@@ -212,7 +216,7 @@ def main():
             print(f"\n[{datetime.now()}] Switching from Anvil to Base Sepolia")
 
         agent = random.choice(agents)
-        event = generate_event(agent, network=current_network)
+        event = generate_event(agent, network=current_network, org_id=args.org)
 
         ok, expected_flag = emit_event(args.api_url, event)
         if ok:
@@ -226,7 +230,9 @@ def main():
                 if emitted_count % 10 == 0:
                     print(f"[{emitted_count}] {agent}: {event['action']} (clean)")
 
-        interval = random.uniform(args.event_interval_min, args.event_interval_max)
+        interval = args.event_interval_min + random.uniform(
+            0.0, args.event_interval_max - args.event_interval_min
+        )
         time.sleep(interval)
 
     print(f"\nEmitted {emitted_count} events ({flagged_count} adversarial)")

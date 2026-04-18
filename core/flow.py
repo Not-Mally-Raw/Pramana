@@ -34,6 +34,7 @@ from core.db import (
     insert_event,
     insert_lifecycle_transition,
     insert_trace,
+    set_agent_paused,
 )
 from core.realtime import publish_event
 from utils.crypto import eth_address_to_uint256, sha256_hex
@@ -64,6 +65,7 @@ class PramanaFlow(Flow[PramanaState]):
         """Entry point. Receives event from listener/API. Initializes state."""
         s = get_settings()
         state = self.state
+        state.pipeline_start_ms = time.perf_counter() * 1000
         if not state.flow_id:
             state.flow_id = str(uuid.uuid4())
 
@@ -139,19 +141,6 @@ class PramanaFlow(Flow[PramanaState]):
             state.final_decision_reason = f"routing_rule:{route}"
             return route
 
-        # 2) Fallback hard thresholds if no rule matched
-        if state.flag_count >= s.ESCALATION_FLAG_THRESHOLD:
-            state.final_decision_reason = (
-                f"flag_count {state.flag_count} >= {s.ESCALATION_FLAG_THRESHOLD}"
-            )
-            return "escalate"
-        if state.risk_score >= s.RISK_SCORE_PAUSE:
-            state.final_decision_reason = f"risk_score {state.risk_score:.3f} >= pause_threshold {s.RISK_SCORE_PAUSE:.3f}"
-            return "pause"
-        if state.risk_score >= s.RISK_SCORE_ESCALATE:
-            state.final_decision_reason = f"risk_score {state.risk_score:.3f} >= escalate_threshold {s.RISK_SCORE_ESCALATE:.3f}"
-            return "escalate"
-
         # Injection hard-pause fallback
         injection_result = next(
             (r for r in state.l1_results if r.agent_name == "injection"), None
@@ -165,6 +154,35 @@ class PramanaFlow(Flow[PramanaState]):
                 f"injection hard-pause fallback score={injection_result.score:.3f}"
             )
             return "pause"
+
+        # 2) Fallback hard thresholds if no rule matched
+        if state.flag_count >= s.ESCALATION_FLAG_THRESHOLD:
+            state.final_decision_reason = (
+                f"flag_count {state.flag_count} >= {s.ESCALATION_FLAG_THRESHOLD}"
+            )
+            return "escalate"
+        if state.risk_score >= s.RISK_SCORE_PAUSE:
+            state.final_decision_reason = f"risk_score {state.risk_score:.3f} >= pause_threshold {s.RISK_SCORE_PAUSE:.3f}"
+            return "pause"
+
+        # Single-agent high-confidence escalation (avoid requiring 2 flags when
+        # one detector is already very confident). Excludes injection (handled
+        # as a pause above).
+        max_flagged_score = 0.0
+        for r in state.l1_results:
+            if r.agent_name == "injection":
+                continue
+            if r.flagged:
+                max_flagged_score = max(max_flagged_score, float(r.score))
+        if max_flagged_score >= s.SINGLE_AGENT_ESCALATE_SCORE:
+            state.final_decision_reason = (
+                f"single_agent_score {max_flagged_score:.3f} >= {s.SINGLE_AGENT_ESCALATE_SCORE:.3f}"
+            )
+            return "escalate"
+
+        if state.risk_score >= s.RISK_SCORE_ESCALATE:
+            state.final_decision_reason = f"risk_score {state.risk_score:.3f} >= escalate_threshold {s.RISK_SCORE_ESCALATE:.3f}"
+            return "escalate"
 
         state.final_decision_reason = "no escalation thresholds matched"
         return "pass"
@@ -405,6 +423,15 @@ class PramanaFlow(Flow[PramanaState]):
                 )
 
         if state.action == FlowAction.PAUSE and state.event:
+            try:
+                set_agent_paused(
+                    agent_addr=state.event.agent_id,
+                    org_id=state.event.org_id,
+                    paused=True,
+                )
+            except (sqlite3.Error, RuntimeError, ValueError, TypeError):
+                pass
+
             try:
                 insert_lifecycle_transition(
                     agent_addr=state.event.agent_id,

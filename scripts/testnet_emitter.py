@@ -26,6 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from core.config.settings import get_settings
 from core.db import get_sqlite_conn, init_sqlite
+from scripts.testnet_config import PRAMANA_ORG_ID
 
 
 @dataclass
@@ -138,9 +139,11 @@ def run(args: argparse.Namespace) -> LoopOutcome:
     att_payload = att.get("payload", {}) if isinstance(att, dict) else {}
 
     decision = str(att_payload.get("decision", data.get("decision", "")))
-    risk_score = float(att_payload.get("risk_score", 0.0) or 0.0)
+    risk_score = float(
+        att_payload.get("risk_score", data.get("risk_score", 0.0)) or 0.0
+    )
     attestation_nonce = str(att_payload.get("nonce", ""))
-    user_op_hash = str(att_payload.get("user_op_hash", ""))
+    user_op_hash = str(att_payload.get("user_op_hash", data.get("user_op_hash", "")))
 
     bundler_send_attempted = False
     bundler_send_ok = False
@@ -208,7 +211,7 @@ def main() -> int:
         "--api", default="http://127.0.0.1:8000", help="Pramana API base URL"
     )
     parser.add_argument(
-        "--org", default="test_org", help="Organization id for JWT claim"
+        "--org", default=PRAMANA_ORG_ID, help="Organization id for JWT claim"
     )
     parser.add_argument(
         "--sender",

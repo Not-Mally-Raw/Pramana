@@ -2,18 +2,32 @@
 
 import { useMemo, useState } from "react";
 import clsx from "clsx";
+import { useRuntimeConfigStore } from "@/stores/runtime";
 import { useSystemStore } from "@/stores/system";
 
-const ORG_OPTIONS = ["default", "research", "treasury"];
+const ORG_OPTIONS = ["default", "demo-prof", "research", "treasury"];
 const NETWORK_OPTIONS = ["Mainnet", "Sepolia", "Anvil"];
 const WINDOW_OPTIONS = ["15m", "1h", "6h", "24h"];
 
 const formatNumber = (value: number) => Intl.NumberFormat("en-US").format(Math.round(value));
 
 export function TopBar() {
-  const [org, setOrg] = useState(ORG_OPTIONS[0]);
+  const org = useRuntimeConfigStore((state) => state.orgId);
+  const setOrg = useRuntimeConfigStore((state) => state.setOrgId);
+  const apiBase = useRuntimeConfigStore((state) => state.apiBase);
   const [network, setNetwork] = useState(NETWORK_OPTIONS[2]);
   const [window, setWindow] = useState(WINDOW_OPTIONS[1]);
+
+  const mergedOrgOptions = useMemo(() => {
+    const normalized = org?.trim();
+    if (!normalized) {
+      return ORG_OPTIONS;
+    }
+    if (ORG_OPTIONS.includes(normalized)) {
+      return ORG_OPTIONS;
+    }
+    return [normalized, ...ORG_OPTIONS];
+  }, [org]);
 
   const apiStatus = useSystemStore((state) => state.apiStatus);
   const decisionsPerMin = useSystemStore((state) => state.decisionsPerMin);
@@ -34,9 +48,12 @@ export function TopBar() {
     <header className="sticky top-0 z-20 border-b border-border-subtle bg-black/80 backdrop-blur-xl">
       <div className="grid gap-3 px-4 py-3 md:grid-cols-[1fr_auto] md:items-center md:px-8">
         <div className="flex flex-wrap items-center gap-2">
-          <Selector label="Org" value={org} onChange={setOrg} options={ORG_OPTIONS} />
+          <Selector label="Org" value={org} onChange={setOrg} options={mergedOrgOptions} />
           <Selector label="Network" value={network} onChange={setNetwork} options={NETWORK_OPTIONS} />
           <Selector label="Window" value={window} onChange={setWindow} options={WINDOW_OPTIONS} />
+          <div className="rounded-full border border-border-subtle bg-surface-card px-3 py-1.5 text-xs text-text-secondary">
+            API {apiBase}
+          </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-4 text-xs">

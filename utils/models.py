@@ -271,6 +271,7 @@ class PramanaState(BaseModel):
     trace_hash: str = ""  # SHA-256 hex
     pause_ref: str = ""  # pre-finalization pause correlation id
     degraded_mode: DegradedMode = DegradedMode.NORMAL
+    pipeline_start_ms: float = 0.0
     flow_id: str = ""  # UUID per execution
     agent_profile: str = (
         "generic"  # treasury_bot | keeper_bot | arb_bot | rebalancer | generic

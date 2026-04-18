@@ -1,24 +1,165 @@
-# Documentation
+# Pramana Documentation
 
-This file combines all Markdown documents in the repository except README files.
+_Last updated: 2026-04-14_
 
-## Source: frontend/AGENTS.md
+Pramana is a runtime interception and governance layer for autonomous on-chain agents. It screens proposed actions under tight latency budgets, records an explainable execution trace, and can couple decisions to on-chain registries for accountability.
 
-<!-- BEGIN:nextjs-agent-rules -->
-# This is NOT the Next.js you know
+Pramana supports **two ingress pipelines** that share the same L0/L1/L2 decision engine:
+- **EOA / ChainEvent monitoring** (`POST /ingest`): used by listeners, simulators, dashboards, and non-ERC-4337 agent actions.
+- **ERC-4337 / Bundler pre-inclusion** (`POST /bundler/validate`): used by bundlers to validate `UserOperation`s before inclusion and receive a signed attestation.
 
-This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` before writing any code. Heed deprecation notices.
-<!-- END:nextjs-agent-rules -->
+The sections below describe the current codebase behavior. Legacy narrative material that no longer matches the implementation is preserved under **Archive**.
+
+## Project Overview
+
+Pramana sits between an agent’s intent and chain execution. Instead of relying on a single “judge,” it runs a deterministic L1 screening DAG to collect multiple, independent safety signals (sanctions, AA validity, injection patterns, economic sanity, behavioral drift) and fuses them into a calibrated risk score. Only borderline cases escalate to an L2 council, keeping the common path bounded and predictable.
+
+Every decision produces cryptographic provenance: a deterministic `TraceDAG` is finalized into a SHA-256 `trace_hash`, persisted for auditability, streamed to the UI in realtime, and optionally emitted on-chain. For ERC-4337 bundlers, Pramana additionally returns an HMAC-signed attestation with block-based TTL and replay protection.
+
+## System Architecture (L0/L1/L2)
+
+### Two runtime pipelines (EOA vs AA)
+
+```mermaid
+flowchart LR
+  subgraph EOA["EOA / ChainEvent Monitoring (POST /ingest)"]
+    E1[Listener / Simulator / SDK] --> E2[/ingest/]
+    E2 --> E3[L0: PramanaFlow]
+      E3 --> E4["L1: MonitoringCrew (9-agent DAG)"]
+    E4 --> E5{Escalation Router}
+    E5 -->|PASS| E6[Finalize TraceDAG + persist]
+    E5 -->|ESCALATE| E7[L2: Council + Recovery + Reputation]
+    E5 -->|PAUSE| E8[Pause flow + lifecycle event]
+    E7 --> E6
+    E8 --> E6
+    E6 --> E9[SQLite traces + realtime stream]
+    E6 --> E10[Optional chain emits]
+  end
+
+  subgraph AA["ERC-4337 Bundler Intercept (POST /bundler/validate)"]
+    B1[Bundler] --> B2[/bundler/validate/]
+    B2 --> B3[Parse UserOperation → ChainEvent]
+      B3 --> B4["L0/L1/L2 (same engine; SLA-bounded)"]
+      B4 --> B5["AttestationService.sign (HMAC + TTL)"]
+    B5 --> B6[Return attestation payload + signature]
+    B6 --> B7[Bundler includes/rejects UserOp]
+      B7 --> B8["/bundler/confirm (optional)/"]
+  end
+```
+
+Notes:
+- `POST /guard/check` is an ultra-fast pre-action hook used by SDK integrations; it runs an injection check synchronously and returns an allow/block decision. It is intentionally narrower than the full L0/L1/L2 pipeline.
+- Storage is split by responsibility: SQLite is the operational store (events, traces, agents, attestations), DuckDB is the analytics feedback loop (agent_metrics, reputation_history), and Chroma is used for vector similarity when enabled.
+
+### L0 (Orchestration + persistence)
+
+- **Primary module**: `core/flow.py` (`PramanaFlow`)
+- **API entrypoints**: `core/app.py` (`/ingest`, `/guard/check`, `/bundler/validate`, `/bundler/confirm`)
+- **Persistence**: `core/db.py` (SQLite + DuckDB)
+- **Realtime telemetry**: `core/realtime.py` + `/ws/stream` and `/metrics/realtime`
+
+L0 responsibilities are: ingest/normalize input, initialize `PramanaState` and `TraceDAG`, run L1 screening, route to PASS/ESCALATE/PAUSE, finalize the trace hash, persist to storage, publish telemetry, and perform optional on-chain writes.
+
+### L1 (Deterministic screening: 9-agent DAG)
+
+L1 is intentionally deterministic: **no Groq calls** occur in L1. Each L1 agent follows a two-pass pattern (`check()` then optional `verify()` when the score is borderline) via `core/agents/base.py`.
+
+Current execution DAG (parallel where safe, hard-stops first):
+
+```mermaid
+flowchart TD
+  S[SanctionsAgent] -->|hard-stop ≥ 0.95| AAV["AAValidatorAgent<br/>(only when UserOperation present)"]
+  AAV --> L1P
+  subgraph L1P["Layer 1 (parallel)"]
+    N[NetworkAgent]
+    O[OperationsAgent]
+    H[HallucinationAgent]
+  end
+  L1P --> L2P
+  subgraph L2P["Layer 2 (parallel)"]
+    I["InjectionAgent<br/>(hard-stop ≥ 0.90)"]
+    V[ValidatorAgent]
+  end
+  L2P --> ES[EconomicSanityAgent]
+  ES --> D[DriftMonitorAgent]
+```
+
+### L2 (Escalation + intervention crew)
+
+- **Council**: `core/agents/council.py` (3 judges, weighted 2/1/1, deterministic fallback when Groq is unavailable)
+- **Recovery**: `core/agents/recovery.py` (playbook-driven mitigations)
+- **Reputation**: `core/agents/reputation.py` (DuckDB-backed aggregation + optional SBT update)
+- **On-chain write path**: `core/crews/intervention.py` writes council outcomes to the Orchestrator registry; `core/flow.py` can emit `TraceFinalized`.
+
+## Agent Inventory (Current L1 = 9 deterministic agents)
+
+| Layer | Agent | Purpose (high-level) | Implementation |
+|---|---|---|---|
+| Hard-stop | `sanctions` | OFAC/AML sanctions screening over all decoded addresses | `core/agents/sanctions.py` |
+| Hard-stop (AA only) | `aa_validator` | ERC-4337 `UserOperation` structure + paymaster/sender solvency checks | `core/agents/aa_validator.py` |
+| Parallel | `network` | Gas spikes, RPC/infra health | `core/agents/network.py` |
+| Parallel | `operations` | Action loops, balance drain heuristics | `core/agents/operations.py` |
+| Parallel | `hallucination` | Off-policy behavior: patterns + vector similarity + historical success | `core/agents/hallucination.py` |
+| Parallel | `injection` | Prompt-/transaction-injection pattern detection | `core/agents/injection.py` |
+| Parallel | `validator` | Schema validation + deterministic structural checks | `core/agents/validator.py` |
+| Sequential | `economic_sanity` | DeFi/economic sanity checks with deterministic 2nd-pass cross-check | `core/agents/economic_sanity.py` |
+| Sequential | `drift_monitor` | Per-agent drift vs baseline, Chroma-backed when enabled | `core/agents/drift.py` |
+
+## Core Algorithms (Evidence-Based)
+
+### 1) Two-pass deterministic L1 checks
+
+All L1 agents inherit from `core/agents/base.py`:
+- Pass 1 (`check()`): fast, bounded work.
+- Pass 2 (`verify()`): only when score is borderline (default band: 0.60–0.80), still deterministic.
+
+Infrastructure failures are treated as **degraded signals** (flagged with a neutral score) so that “unknown” routes to escalation rather than a false clean pass.
+
+### 2) Risk fusion across heterogeneous signals
+
+L1 outputs are fused into a single risk score in `core/crews/intervention.py` as a weighted average plus two correction terms:
+
+$$
+
+\mathrm{base} = \frac{\sum_i w_i s_i}{\sum_i w_i}
+$$
+
+$$
+\mathrm{fused} = \mathrm{clip}_{[0,1]}(\mathrm{base} + \mathrm{densityBonus} + \mathrm{uncertaintyPenalty})
+$$
+
+This improves stability by (a) rewarding agreement across independent detectors and (b) penalizing “skipped”/missing signals in degraded modes.
+
+### 3) Deterministic TraceDAG provenance (SHA-256)
+
+The canonical trace object is `utils/graph.py` (`TraceDAG`). L0 finalization computes a deterministic adjacency-list JSON and hashes it (SHA-256) into `trace_hash`, which is persisted and can be emitted on-chain.
+
+### 4) ERC-4337 attestations (HMAC + replay protection)
+
+`core/attestation.py` signs bundler decisions with HMAC-SHA256, binds them to `user_op_hash`, and enforces replay protection through the SQLite `attestation_log`. TTL uses block-based expiry when RPC is available, with a compatibility fallback to wall-clock time.
+
+```mermaid
+sequenceDiagram
+  participant Bundler
+  participant Pramana as Pramana API
+  participant DB as SQLite (attestation_log)
+
+  Bundler->>Pramana: POST /bundler/validate (UserOperation)
+  Pramana->>DB: idempotency + replay checks
+  Pramana->>Pramana: run decision engine (SLA-bounded)
+  Pramana->>DB: write attestation_log (nonce + expiry)
+  Pramana-->>Bundler: attestation payload + HMAC signature
+  Bundler->>Pramana: POST /bundler/confirm (nonce, tx_hash)
+  Pramana->>DB: mark redeemed
+```
 
 ---
 
-## Source: frontend/CLAUDE.md
+## Archive: Comprehensive Review (Legacy — does not match current code)
 
-@AGENTS.md
+<details>
+<summary>Click to expand archived content (kept for historical context)</summary>
 
----
-
-## Source: PRAMANA_COMPREHENSIVE_REVIEW.md
 
 # PRAMANA: Autonomous Agent Monitoring & Governance Platform - Comprehensive Review
 
@@ -1192,7 +1333,9 @@ Future work: Cross-chain MEV detection, privacy-preserving reputation (ZK), and 
 
 ---
 
-## Source: PRAMANA_LITERATURE_REVIEW.md
+</details>
+
+## Appendix: Evidence-Disciplined Draft (PRAMANA_LITERATURE_REVIEW.md)
 
 # PRAMANA: A Pre-Inclusion Safety Oracle for ERC-4337 Autonomous Agents with Deterministic L1 Screening and Cryptographic Provenance
 
@@ -1431,7 +1574,7 @@ This revision aligns claims with evidence: unsupported BFT and MRL implementatio
 *End of Evidence-Disciplined Draft*
 ---
 
-## Source: TESTING_PHASES_AND_AA_AGENTS.md
+## Testing Phases & AA Agents Route
 
 # Pramana Testing Phases & Journey to AA Agents Route
 
@@ -1867,4 +2010,90 @@ Why:
 Ready to proceed?
 
 ---
+
+## Blockchain-Based Concepts Used
+
+This project is intentionally “blockchain-native” — the runtime pipeline and data model are built around the semantics of pre-inclusion validation, deterministic provenance, and governance coupling.
+
+### Account Abstraction (ERC-4337) concepts
+
+- **`UserOperation` (alt-mempool transaction intent)**: the unit Pramana evaluates in the bundler pipeline (`/bundler/validate`).
+- **EntryPoint contracts (v0.6/v0.7)**: canonical EntryPoint addresses are enforced/checked as part of AA validation.
+- **Bundlers**: infrastructure that assembles and submits `UserOperation`s; Pramana returns allow/block decisions + attestations that bundlers can act on.
+- **Paymasters**: sponsors who pay gas for smart accounts; solvency/deposit checks are part of AA safety.
+- **Nonce “lanes” / split nonces**: AA nonces can encode parallel lanes; abuse is a concrete AA risk signal.
+- **AA gas fields**: `callGasLimit`, `verificationGasLimit`, `preVerificationGas`, and fee caps are validated for plausibility and inflation.
+- **Pre-inclusion SLA constraints**: decisions must complete fast enough to be useful inside bundler verification windows; Pramana treats timeouts as degraded signals with a configurable fallback policy.
+
+### Cryptographic provenance & replay protection
+
+- **Deterministic trace hashing (`TraceDAG` → SHA-256)**: every flow finalizes a stable adjacency-list JSON into a `trace_hash` for tamper detection and auditability.
+- **Attestation signing (HMAC-SHA256)**: bundler decisions are bound to `user_op_hash` with an HMAC signature (`core/attestation.py`).
+- **Block-based TTL**: attestations expire at `expires_at_block` when RPC is available, with a wall-clock fallback for compatibility.
+- **Replay protection and redemption**: attestations are logged in SQLite and can be marked redeemed via `/bundler/confirm`.
+- **Keccak vs SHA**: Keccak-256 is used where EVM conventions apply (e.g., identifiers), while SHA-256 is used for deterministic trace hashing.
+
+### Governance, registry, and reputation primitives
+
+- **On-chain event logs (cheap audit surface)**: Orchestrator emits `TraceFinalized`, `CouncilDecision`, `AgentPaused`, etc. (events-only by design).
+- **Registry patterns**: agent registration and pause state are mirrored on-chain for portability and governance hooks.
+- **Soulbound tokens (SBTs)**: reputation can be published via a non-transferable token, enabling staking/insurance/governance weighting patterns.
+- **Policy-hash anchoring**: Guardian-style contracts can store a compact hash of a richer off-chain policy JSON (versioned rule hashes).
+
+### Execution semantics & security model
+
+- **EOA vs smart account execution**: Pramana supports post-intent monitoring (`/ingest`) and pre-inclusion AA validation (`/bundler/validate`).
+- **RPC simulation (`eth_call`)**: used for deterministic verification of structural validity without broadcasting.
+- **Chain identity (`chainId`) and network routing**: bundler requests include chain context that can be whitelisted/authorized.
+- **Gas pricing & MEV surface**: gas spikes and bidding patterns are treated as first-class safety signals.
+
+## Improvement Recommendations (Phase 1.5 → Phase 2)
+
+These are the recommended next improvements to reduce operational risk and to make the AA/bundler path reliable under real-world timing constraints.
+
+### Phase 1.5 — Pipeline hardening + clarity (near-term)
+
+1. **Bundler fast-path execution**
+  - Run only the L1 DAG + risk fusion inside `/bundler/validate`, and defer trace finalization + persistence + non-critical telemetry to background tasks.
+  - Goal: eliminate `pipeline_timeout_800ms` degraded responses for normal traffic.
+
+2. **Unify decision semantics across `/ingest` and `/bundler/validate`**
+  - Standardize decision labels (`PASS/ESCALATE/PAUSE/EMERGENCY`), decision sources, and degraded reasons so the dashboard cannot conflate “clean” with “timed out.”
+
+3. **Explicit pipeline attribution in telemetry**
+  - Add a `pipeline` field (e.g., `ingest`, `bundler_validate`, `guard_check`) to traces and realtime events so charts and alerts stay apples-to-apples.
+
+4. **Guard endpoint expansion (still deterministic)**
+  - Extend `/guard/check` beyond injection-only to include sanctions decoding and (when present) AA structural validation, while keeping it bounded (<~50ms target).
+
+5. **Continuous regression harness with real personas**
+  - Finish the autonomous test-agent fleet under `scripts/agents/` to generate both clean and adversarial traffic and to detect false PAUSE regressions early.
+
+### Phase 2 — End-to-end AA reliability (localnet → testnet)
+
+1. **Run with a real ERC-4337 bundler service in localnet**
+  - Anvil does not natively expose `eth_sendUserOperation`; Phase 2 should include a bundler container/service to validate attestations under realistic timing.
+
+2. **SDK-side attestation verification**
+  - Provide a small verifier library (TypeScript + Python) that checks the HMAC signature, TTL, and redemption semantics, so clients can treat Pramana attestations as portable artifacts.
+
+3. **Governance hardening for Guardian-style flows**
+  - Make the “pause-vote” path align with the intended signer model (either true multi-signer logic in-contract or explicit integration with an external multisig like Safe).
+
+4. **On-chain enforcement optionality**
+  - Add an explicit “enforcement mode” per org/agent: monitor-only vs on-chain pause writes vs bundler-hard-block. This keeps testing and rollout controlled.
+
+---
+
+## Appendix: Frontend Agent Rules
+
+<!-- BEGIN:nextjs-agent-rules -->
+### This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` before writing any code. Heed deprecation notices.
+<!-- END:nextjs-agent-rules -->
+
+### Source: frontend/CLAUDE.md
+
+@AGENTS.md
 
