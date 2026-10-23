@@ -1,0 +1,15 @@
+flowchart LR
+  I[ingest] --> D[delegation]
+  I --> S[sanctions]
+  I --> N[network]
+  I --> O[operations]
+  I --> H[hallucination]
+  N --> V[validator]
+  O --> V
+  H --> C[council if escalated]
+  D --> C
+  S --> C
+  V --> F[finalize]
+  C --> F
+  F --> X[trace hash from canonical DAG JSON]
+  X --> CH[optional on-chain TraceFinalized event]

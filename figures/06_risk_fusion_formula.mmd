@@ -1,0 +1,13 @@
+flowchart TD
+  A[L1 Scores and Weights] --> B[Weighted Base Score]
+  B --> C[Density Bonus from Multi-Agent Agreement]
+  B --> D[Uncertainty Penalty from Missing or Skipped Signals]
+  C --> E[Fused Risk Score]
+  D --> E
+  E --> F[Clip to 0..1]
+  F --> G[Routing Threshold Evaluation]
+
+  subgraph Formula
+    F1[base from weighted scores]
+    F2[fused score after bonus and penalty]
+  end

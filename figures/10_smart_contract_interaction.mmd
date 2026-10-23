@@ -1,0 +1,18 @@
+flowchart LR
+  subgraph Offchain[Off-chain Pramana Runtime]
+    A[PramanaFlow]
+    B[Policy Engine]
+    C[Reputation Agent]
+  end
+
+  subgraph Onchain[On-chain Contracts]
+    O[OrchestratorRegistry]
+    G[Guardian]
+    R[ReputationSBT]
+  end
+
+  A -->|finalizeTrace, recordCouncilDecision| O
+  B -->|setPolicy, rollbackPolicy, requestPause| G
+  C -->|batchUpdateScores| R
+  O -.org and agent identity.-> R
+  G -.pause and trace link metadata.-> O

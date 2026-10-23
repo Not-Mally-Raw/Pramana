@@ -1,0 +1,20 @@
+sequenceDiagram
+  participant Bundler
+  participant API as Pramana API
+  participant Parser as UserOp Parser
+  participant Flow as Monitoring Pipeline
+  participant Att as Attestation Service
+  participant DB as SQLite
+
+  Bundler->>API: POST /bundler/validate (UserOperation)
+  API->>Parser: Parse and canonicalize hash
+  Parser-->>API: user_op_hash and ChainEvent
+  API->>Flow: Execute L1 and routing
+  Flow-->>API: decision, risk_score, trace_hash
+  API->>Att: sign(user_op_hash, decision, risk, trace)
+  Att->>DB: store attestation nonce and TTL
+  Att-->>API: signed payload
+  API-->>Bundler: 200 decision + signature
+  Bundler->>API: POST /bundler/confirm
+  API->>DB: mark redeemed
+  API-->>Bundler: confirmation accepted

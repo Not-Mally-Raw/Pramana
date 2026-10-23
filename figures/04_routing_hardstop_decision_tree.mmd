@@ -1,0 +1,18 @@
+flowchart TD
+  S[Start with L1 Results] --> R{Rule matched in routing table?}
+  R -->|Yes| O[Apply route from rule]
+  R -->|No| I{Injection score >= hard threshold?}
+  I -->|Yes| P[PAUSE]
+  I -->|No| F{Flag count >= threshold?}
+  F -->|Yes| E[ESCALATE]
+  F -->|No| Q{Risk score >= pause threshold?}
+  Q -->|Yes| P
+  Q -->|No| G{Any single flagged score >= single-agent threshold?}
+  G -->|Yes| E
+  G -->|No| H{Risk score >= escalate threshold?}
+  H -->|Yes| E
+  H -->|No| A[PASS]
+  O --> Z[Finalize]
+  A --> Z
+  E --> Z
+  P --> Z

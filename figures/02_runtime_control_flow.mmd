@@ -1,0 +1,14 @@
+flowchart LR
+  classDef l0 fill:#e0f2fe,stroke:#0284c7,stroke-width:2px;
+  classDef l1 fill:#ecfccb,stroke:#65a30d,stroke-width:2px;
+  classDef l2 fill:#fae8ff,stroke:#a21caf,stroke-width:2px;
+  classDef term fill:#fee2e2,stroke:#dc2626,stroke-width:2px;
+
+  A[Ingest Event]:::l0 --> B[Initialize State and Trace DAG]:::l0 --> C[Run L1 Monitoring Crew]:::l1
+  C --> D{Routing Decision}:::l0
+  D -->|pass| E[PASS Path]:::term
+  D -->|escalate| F[Run L2 Council]:::l2
+  D -->|pause| G[Emergency Pause Path]:::term
+  F --> H[Recovery and Reputation]:::l2 --> I[Finalize Trace]:::term
+  E --> I
+  G --> I

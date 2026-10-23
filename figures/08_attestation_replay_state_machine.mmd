@@ -1,0 +1,11 @@
+stateDiagram-v2
+  [*] --> Issued
+  Issued --> Verified: signature and TTL valid
+  Issued --> Expired: block/time TTL exceeded
+  Issued --> Rejected: signature mismatch or hash mismatch
+  Verified --> Redeemed: confirm endpoint consumes token
+  Verified --> ReplayRejected: reused hash or redeemed nonce
+  Redeemed --> [*]
+  Expired --> [*]
+  Rejected --> [*]
+  ReplayRejected --> [*]

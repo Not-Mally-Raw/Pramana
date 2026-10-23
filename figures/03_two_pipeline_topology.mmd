@@ -1,0 +1,16 @@
+flowchart TB
+  subgraph EOA[EOA ChainEvent Path]
+    E1[/POST ingest/] --> E2[PramanaFlow]
+    E2 --> E3[L1 Monitoring]
+    E3 --> E4[L2 if needed]
+  end
+
+  subgraph AA[ERC-4337 Bundler Path]
+    A1[/POST bundler/validate/] --> A2[UserOp Parse and Canonical Hash]
+    A2 --> A3[L1 Monitoring]
+    A3 --> A4[Signed Attestation]
+    A4 --> A5[/POST bundler/confirm/]
+  end
+
+  E4 --> M[(Shared Trace and Metrics Stores)]
+  A4 --> M

@@ -1,0 +1,14 @@
+flowchart TD
+  A[Resolve sender from metadata or event] --> B{sender code exists?}
+  B -->|No| C[no delegation clean]
+  B -->|Yes| D{code starts with 0xef0100?}
+  D -->|No| E[sender has non-EIP7702 code]
+  D -->|Yes| F[extract delegation target]
+  F --> G{target in malicious set?}
+  G -->|Yes| H[flag high risk hard-stop]
+  G -->|No| J{target in safe set?}
+  J -->|Yes| K[allow low risk]
+  J -->|No| L[estimate contract age]
+  L --> M{new contract?}
+  M -->|Yes| N[flag high risk]
+  M -->|No| O[flag moderate risk]
